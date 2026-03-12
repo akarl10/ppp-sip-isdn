@@ -7,11 +7,13 @@ It is not intended to develop this to a fully fledged all corner case handling a
 https://www.youtube.com/watch?v=rQfy8T-VOs4
 from "The Serial Port" channel
 
-V.110 or x.75 is not implemented.
+V.110, V.120 or X.75 is not implemented.
 
 V.110 might be useful for this to be a GSM dialup server (or calling a ppp server that runs over GSM)
 
-I don't see a need for x.75
+I don't see a need for X.75 since as far as I know usually ppp/internet was set up mostly using RFC1662
+
+The reason why this application does not support emulating a AT modem is because this application will only work with ppp and not dealing with AT commands too calling pppd directly was choosen.
 
 # How to use it
 In doubt see the source code, but in general something like this on the "server" side (as root because of pppd)
@@ -21,6 +23,13 @@ ppp-sip-isdn --loglevel 1 --id sip:number@pbx.server --reg sip:pbx.server --user
 
 and on the "client" (channel bind 2 calls, as root because of pppd)
 ```bash
-ppp-sip-isdn --loglevel 1 --id sip:number@pbx.server --reg sip:pbx.server --user number --pass XXXXXXXXXXX --pppd "nodetach debug noauth user myuser password mypassword mp" --bindport 44443 --linecount 2
+ppp-sip-isdn --loglevel 1 --id sip:number@pbx.server --reg sip:pbx.server --user number --pass XXXXXXXXXXX --pppd "nodetach debug noauth user myuser password mypassword mp" --bindport 44443 --linecount 2 --dial sip:dialinnumber@pbx.server
 ```
+# How to build
 
+```bash
+cd ppp-sip-isdn
+git submodule init
+git submodule upate
+make
+```

@@ -271,7 +271,7 @@ typedef struct {
 
 static ppp_media_port * lines;
 
-size_t ppp_escape_pppd(const uint8_t *in, size_t in_len, uint8_t *out) {
+size_t ppp_escape_pppd(const uint8_t *in, size_t in_len, uint8_t *out, size_t max_len) {
     size_t i = 0, j = 0;
 
     while (i < in_len) {
@@ -288,6 +288,7 @@ size_t ppp_escape_pppd(const uint8_t *in, size_t in_len, uint8_t *out) {
             out[j++] = in[i];
         }
         i++;
+        if(max_len<j) return j;
     }
     return j; // number of bytes written to out[]
 }
@@ -298,18 +299,17 @@ static void deliver_ppp_frame(const uint8_t *data, int len, void *user)
     ppp_media_port *p = (ppp_media_port*)user;
     uint8_t buf[4192];
     if (len > 0 && len < 3128) {
-        // if(len<50 && len>5 && p->rxfrmcnt<10) { // show first 10 frames
-        //         printf("<Packet is ");
-        //         for(int i=0;i<len; i++)
-        //                 printf("%x ",data[i]);
-        //         printf("\n");
-        // }
         buf[0]=0x7e;
-        size_t l = ppp_escape_pppd(data,len,buf+1);
-        buf[l+1]=0x7e;
+        size_t datalen = ppp_escape_pppd(data,len,buf+1, sizeof(buf)-2);
+        buf[datalen+1]=0x7e;
         p->rxfrmcnt++;
-        write(p->link.master_fd, buf, l+2);
+        // we pre and append 0x7e, so the data to write is +2
+        size_t wl = write(p->link.master_fd, buf, datalen+2);
+        if(wl<(datalen+2))
+            printf("short write\n");
     }
+    //if peer responded and actually sent something like a ppp frame, check if additional lines should be added
+    //do this only on the first packet. the first time there will never arrive 2 at the same time
     if(cli_dial && p->rxfrmcnt==1) {
         for(int i=0;i<linecount;i++) {
             if(!lines[i].active) {

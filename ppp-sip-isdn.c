@@ -759,8 +759,10 @@ int main(int argc, char **argv)
     pjsua_acc_config acc;
     pjsua_acc_config_default(&acc);
     acc.id = pj_str(cli_id);
-    if(cli_ip6)
+    if(cli_ip6) {
         acc.ipv6_sip_use=PJSUA_IPV6_ENABLED_USE_IPV6_ONLY;
+        acc.ipv6_media_use=PJSUA_IPV6_ENABLED_USE_IPV6_ONLY;
+    }
     if(cli_reg) {
         acc.reg_uri = pj_str(cli_reg);
         acc.cred_count = 1;

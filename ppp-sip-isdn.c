@@ -32,6 +32,7 @@ static int cli_port = 0;
 static int cli_loglevel = 0;
 static int terminate = 0;
 static int linecount = 1;
+static int cli_ip6 = 0;
 
 /* ================= PPPD VIA PTY ================= */
 
@@ -656,11 +657,12 @@ static void parse_cli(int argc, char **argv)
         else if (!strcmp(argv[i], "--linecount")) linecount = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pppremoteipstart")) cli_pppremoteipstart = parseip(argv[++i]);
         else if (!strcmp(argv[i], "--ppplocalip")) cli_ppplocalip = parseip(argv[++i]);
+        else if (!strcmp(argv[i], "--ipv6")) cli_ip6=1;
     }
 
-    if (!cli_id || !cli_reg || !cli_user || !cli_pass) {
+    if (!cli_id || (cli_reg && (!cli_user || !cli_pass))) {
         fprintf(stderr,
-            "Required: --id --reg --user --pass\n");
+            "Required: --id, --user and --pass if --reg\n");
         exit(1);
     }
 
@@ -734,11 +736,12 @@ int main(int argc, char **argv)
     pjsua_transport_config tcfg;
     pjsua_transport_config_default(&tcfg);
     tcfg.port = cli_port;
-#if 0
-    pj_status_t status = pjsua_transport_create(PJSIP_TRANSPORT_UDP6, &tcfg, NULL);
-#else
-    pj_status_t status = pjsua_transport_create(PJSIP_TRANSPORT_UDP, &tcfg, NULL);
-#endif
+    pj_status_t status;
+    if(cli_ip6)
+        status = pjsua_transport_create(PJSIP_TRANSPORT_UDP6, &tcfg, NULL);
+    else
+        status = pjsua_transport_create(PJSIP_TRANSPORT_UDP, &tcfg, NULL);
+
     if (status != PJ_SUCCESS) {
         char errmsg[PJ_ERR_MSG_SIZE];
         pj_strerror(status, errmsg, sizeof(errmsg));
@@ -756,15 +759,19 @@ int main(int argc, char **argv)
     pjsua_acc_config acc;
     pjsua_acc_config_default(&acc);
     acc.id = pj_str(cli_id);
-    acc.reg_uri = pj_str(cli_reg);
-    acc.cred_count = 1;
-    acc.cred_info[0].realm = pj_str("*");
-    acc.cred_info[0].scheme = pj_str("digest");
-    acc.cred_info[0].username = pj_str(cli_user);
-    acc.cred_info[0].data_type = PJSIP_CRED_DATA_PLAIN_PASSWD;
-    acc.cred_info[0].data = pj_str(cli_pass);
-    acc.proxy_cnt = 1;
-    acc.proxy[0] = pj_str(cli_reg); // e.g. "sip:pbx.example.com;lr"
+    if(cli_ip6)
+        acc.ipv6_sip_use=PJSUA_IPV6_ENABLED_USE_IPV6_ONLY;
+    if(cli_reg) {
+        acc.reg_uri = pj_str(cli_reg);
+        acc.cred_count = 1;
+        acc.cred_info[0].realm = pj_str("*");
+        acc.cred_info[0].scheme = pj_str("digest");
+        acc.cred_info[0].username = pj_str(cli_user);
+        acc.cred_info[0].data_type = PJSIP_CRED_DATA_PLAIN_PASSWD;
+        acc.cred_info[0].data = pj_str(cli_pass);
+        acc.proxy_cnt = 1;
+        acc.proxy[0] = pj_str(cli_reg); // e.g. "sip:pbx.example.com;lr"
+    }
 
     pjsua_acc_id acc_id;
     status = pjsua_acc_add(&acc, PJ_TRUE, &acc_id);
@@ -772,8 +779,8 @@ int main(int argc, char **argv)
         printf("acc_add failed\n");
         return 1;
     }
-    
-    wait_for_registration(acc_id);
+    if(cli_reg)
+        wait_for_registration(acc_id);
 
     if (cli_dial) {
         printf("Dialing (CLEARMODE only) %s\n", cli_dial);

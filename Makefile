@@ -16,7 +16,7 @@ $(APP): $(SRC) $(PKG_CONFIG_PATH)/libpjproject.pc
 	$(CC) $(CFLAGS) -o $(APP) $(SRC) $(LDFLAGS) `PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --static --cflags --libs libpjproject`
 
 $(PKG_CONFIG_PATH)/libpjproject.pc:
-	(cd $(PJSIP_DIR); [ -f ./config.status ] || CFLAGS=-DPJSUA_MAX_CALLS=512 ./configure --prefix=`pwd`/../pjsip.install --disable-video --disable-sound)
+	(cd $(PJSIP_DIR); [ -f ./config.status ] || CFLAGS="-DPJSUA_MAX_CALLS=512 -DPJ_HAS_IPV6=1" ./configure --prefix=`pwd`/../pjsip.install --disable-video --disable-sound)
 	$(MAKE) -C $(PJSIP_DIR) && \
 	$(MAKE) -C $(PJSIP_DIR) install
 

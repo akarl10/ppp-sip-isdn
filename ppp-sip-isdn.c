@@ -33,6 +33,7 @@ static int cli_loglevel = 0;
 static int terminate = 0;
 static int linecount = 1;
 static int cli_ip6 = 0;
+static pj_pool_t *pjsua_pool = 0;
 
 /* ================= PPPD VIA PTY ================= */
 
@@ -569,7 +570,6 @@ static void on_call_media_state(pjsua_call_id cid)
         
         pjsua_conf_port_id call_conf = pjsua_call_get_conf_port(cid);
 
-        pj_pool_t *pool = pjsua_pool_create("ppp", 1024, 1024);
 
         if (ppp_media_port_reset(cli_pppd, ppp) != PJ_SUCCESS) {
             printf("PPP port failed\n");
@@ -579,7 +579,7 @@ static void on_call_media_state(pjsua_call_id cid)
         ppp->call = cid;
 
         pjsua_conf_port_id ppp_conf;
-        pjsua_conf_add_port(pool, &ppp->base, &ppp_conf);
+        pjsua_conf_add_port(pjsua_pool, &ppp->base, &ppp_conf);
 
         pjsua_conf_connect(call_conf, ppp_conf);
         pjsua_conf_connect(ppp_conf, call_conf);
@@ -690,6 +690,33 @@ static void wait_for_registration(pjsua_acc_id acc_id)
     printf("Registration did not complete in time\n");
 }
 
+static void configure_dns_resolver(pjsua_config* cfg,pj_pool_t* pjsua_pool) {
+    FILE *resolv_conf;
+    char line[256];
+    cfg->nameserver_count = 0;
+
+    resolv_conf = fopen("/etc/resolv.conf", "r");
+    if (!resolv_conf) {
+        return;
+    }
+
+    while ( fgets(line, sizeof(line), resolv_conf) && cfg->nameserver_count < 4) {
+        // Skip lines that don't start with "nameserver"
+        if (strncmp(line, "nameserver", 10) != 0) {
+            continue;
+        }
+        int l = strlen(line);
+        if(line[l-1]=='\n') line[l-1]='\0';
+            if(strncmp(line,"nameserver",10)==0) {
+                int ipstart = 11;
+                while(line[ipstart]==' ' || line[ipstart]=='\t') ipstart++;
+                pj_str_t resolver = pj_str(line+ipstart);
+                pj_strdup(pjsua_pool,&cfg->nameserver[cfg->nameserver_count],&resolver);
+                cfg->nameserver_count++;
+            }
+    }
+    fclose(resolv_conf);
+}
 
 /* ================= MAIN ================= */
 
@@ -715,6 +742,10 @@ int main(int argc, char **argv)
     cfg.cb.on_incoming_call   = on_incoming_call;
     cfg.cb.on_call_media_state= on_call_media_state;
     cfg.cb.on_call_state      = on_call_state;
+
+    pjsua_pool = pjsua_pool_create("pjsua", 128, 128);
+
+    configure_dns_resolver(&cfg,pjsua_pool);
 
     pjsua_logging_config_default(&log);
     log.console_level = cli_loglevel;
@@ -795,5 +826,6 @@ int main(int argc, char **argv)
 
     while(!terminate)
         pj_thread_sleep(1000);
+    pj_pool_release(pjsua_pool);
 }
 

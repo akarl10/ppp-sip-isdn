@@ -18,6 +18,9 @@
 #include <fcntl.h>
 #include "clearmode_codec.h"
 
+#define T_UDP 0
+#define T_TCP 1
+#define T_TLS 2
 /* ================= CLI PARAMS ================= */
 
 static char *cli_id   = NULL;
@@ -33,6 +36,7 @@ static int cli_loglevel = 0;
 static int terminate = 0;
 static int linecount = 1;
 static int cli_ip6 = 0;
+static int cli_srtp = 0;
 
 /* ================= PPPD VIA PTY ================= */
 
@@ -667,6 +671,7 @@ static void parse_cli(int argc, char **argv)
         else if (!strcmp(argv[i], "--pppremoteipstart")) cli_pppremoteipstart = parseip(argv[++i]);
         else if (!strcmp(argv[i], "--ppplocalip")) cli_ppplocalip = parseip(argv[++i]);
         else if (!strcmp(argv[i], "--ipv6")) cli_ip6=1;
+        else if (!strcmp(argv[i], "--srtp")) cli_srtp=1;
     }
 
     if (!cli_id || (cli_reg && (!cli_user || !cli_pass))) {
@@ -769,6 +774,16 @@ int main(int argc, char **argv)
 
     media.clock_rate = 8000;
     media.snd_clock_rate = 8000;
+    
+    if(cli_srtp) {
+        cfg.use_srtp = PJMEDIA_SRTP_OPTIONAL;
+        cfg.srtp_secure_signaling = 0;
+        pjsua_srtp_opt_default(&cfg.srtp_opt);
+        cfg.srtp_opt.keying_count=2;
+        cfg.srtp_opt.keying[0] = PJMEDIA_SRTP_KEYING_SDES;
+        cfg.srtp_opt.keying[1] = PJMEDIA_SRTP_KEYING_DTLS_SRTP;
+    }
+    
     pjsua_init(&cfg, &log, &media);
 
     /* Register all built-in audio codecs (includes CLEARMODE) */
@@ -783,10 +798,19 @@ int main(int argc, char **argv)
     pjsua_transport_config_default(&tcfg);
     tcfg.port = cli_port;
     pj_status_t status;
-    if(cli_ip6)
-        status = pjsua_transport_create(PJSIP_TRANSPORT_UDP6, &tcfg, NULL);
-    else
-        status = pjsua_transport_create(PJSIP_TRANSPORT_UDP, &tcfg, NULL);
+    int transport = T_UDP;
+    if(cli_reg && strncmp(cli_reg,"sips:",5)==0)
+        transport = T_TLS;
+    else if(cli_reg && strcasestr(cli_reg,"transport=tcp")!=NULL)
+        transport = T_TCP;
+    else if(cli_dial && strncmp(cli_dial,"sips:",5)==0)
+        transport = T_TLS;
+    else if(cli_dial && strcasestr(cli_dial,"transport=tcp")!=NULL)
+        transport = T_TCP;
+    status = pjsua_transport_create(
+        (transport==T_UDP?PJSIP_TRANSPORT_UDP:
+            (transport==T_TLS?PJSIP_TRANSPORT_TLS:PJSIP_TRANSPORT_TCP)
+        ) + (cli_ip6?PJSIP_TRANSPORT_IPV6:0), &tcfg, NULL);
 
     if (status != PJ_SUCCESS) {
         char errmsg[PJ_ERR_MSG_SIZE];
@@ -795,6 +819,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if(transport == T_TLS && cli_srtp)
+        cfg.use_srtp = PJMEDIA_SRTP_MANDATORY;
+    
     printf("SIP UDP transport active on port %d\n", cli_port);
 
     pjsua_start();
@@ -819,6 +846,15 @@ int main(int argc, char **argv)
         acc.cred_info[0].data = pj_str(cli_pass);
         acc.proxy_cnt = 1;
         acc.proxy[0] = pj_str(cli_reg); // e.g. "sip:pbx.example.com;lr"
+        
+        if(cli_srtp) {
+            acc.use_srtp = (transport<2?PJMEDIA_SRTP_OPTIONAL:PJMEDIA_SRTP_MANDATORY);
+            acc.srtp_secure_signaling = 0;
+            pjsua_srtp_opt_default(&acc.srtp_opt);
+            acc.srtp_opt.keying_count=2;
+            acc.srtp_opt.keying[0] = PJMEDIA_SRTP_KEYING_SDES;
+            acc.srtp_opt.keying[1] = PJMEDIA_SRTP_KEYING_DTLS_SRTP;
+        }
     }
 
     pjsua_acc_id acc_id;
@@ -834,7 +870,12 @@ int main(int argc, char **argv)
         printf("Dialing (CLEARMODE only) %s\n", cli_dial);
         pj_str_t dialstr = pj_str(cli_dial);
         pjsua_call_id current_call = PJSUA_INVALID_ID;
-        pjsua_call_make_call(acc_id, &dialstr, 0, NULL, NULL, &current_call);
+        pjsua_call_setting call_settings;
+        pjsua_call_setting_default(&call_settings);
+        call_settings.aud_cnt = 1;
+        call_settings.vid_cnt = 0;
+        call_settings.txt_cnt = 0; // Ensure this is zero to prevent m=text
+        pjsua_call_make_call(acc_id, &dialstr, &call_settings, NULL, NULL, &current_call);
     } else {
         printf("Waiting for incoming CLEARMODE data call...\n");
     }

@@ -45,6 +45,6 @@ you should get 2*64kbps. Once maybe that felt blazing fast, but except for nosta
 ```bash
 cd ppp-sip-isdn
 git submodule init
-git submodule upate
+git submodule update
 make
 ```

@@ -33,7 +33,6 @@ static int cli_loglevel = 0;
 static int terminate = 0;
 static int linecount = 1;
 static int cli_ip6 = 0;
-static pj_pool_t *pjsua_pool = 0;
 
 /* ================= PPPD VIA PTY ================= */
 
@@ -257,6 +256,7 @@ typedef struct {
 
     hdlc_rx_state rx;
     hdlc_tx_state tx;
+    pj_pool_t *pool;
 
     uint8_t tx_buf[4096];
     int     tx_len;
@@ -477,6 +477,10 @@ static pj_status_t ppp_destroy(pjmedia_port *port)
     for(int i=0;i<linecount;i++) {
         if(lines+i == p) {
             lines[i].active = 0;
+            if(p->pool) {
+                pj_pool_release(p->pool);
+                p->pool = NULL;
+            }
         }
     }
     return PJ_SUCCESS;
@@ -568,8 +572,13 @@ static void on_call_media_state(pjsua_call_id cid)
             return;
         }
         
+        if(!ppp->pool) {
+            char poolname[PJ_MAX_OBJ_NAME];
+            memset(poolname,0,PJ_MAX_OBJ_NAME);
+            snprintf(poolname,PJ_MAX_OBJ_NAME-1,"mp-%lx",(long unsigned int)ppp);
+            ppp->pool = pjsua_pool_create(poolname, 512, 512);
+        }
         pjsua_conf_port_id call_conf = pjsua_call_get_conf_port(cid);
-
 
         if (ppp_media_port_reset(cli_pppd, ppp) != PJ_SUCCESS) {
             printf("PPP port failed\n");
@@ -579,7 +588,7 @@ static void on_call_media_state(pjsua_call_id cid)
         ppp->call = cid;
 
         pjsua_conf_port_id ppp_conf;
-        pjsua_conf_add_port(pjsua_pool, &ppp->base, &ppp_conf);
+        pjsua_conf_add_port(ppp->pool, &ppp->base, &ppp_conf);
 
         pjsua_conf_connect(call_conf, ppp_conf);
         pjsua_conf_connect(ppp_conf, call_conf);
@@ -730,7 +739,13 @@ int main(int argc, char **argv)
 
     for(int i=0;i<linecount;i++) {
         lines[i].active=0;
-        if(cli_pppremoteipstart) lines[i].remoteip = cli_pppremoteipstart++;
+        lines[i].pool=NULL;
+        if(cli_pppremoteipstart) {
+            lines[i].remoteip = cli_pppremoteipstart++;
+            // don't use .0 and .255. Should be valid ip addresses but might make problems
+            if ((lines[i].remoteip%256)==255) lines[i].remoteip = cli_pppremoteipstart++;
+            if ((lines[i].remoteip%256)==0) lines[i].remoteip = cli_pppremoteipstart++;
+        }
     }
     pjsua_create();
 
@@ -743,7 +758,7 @@ int main(int argc, char **argv)
     cfg.cb.on_call_media_state= on_call_media_state;
     cfg.cb.on_call_state      = on_call_state;
 
-    pjsua_pool = pjsua_pool_create("pjsua", 128, 128);
+    pj_pool_t* pjsua_pool = pjsua_pool_create("pjsua", 128, 128);
 
     configure_dns_resolver(&cfg,pjsua_pool);
 

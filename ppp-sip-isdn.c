@@ -548,7 +548,8 @@ static void on_incoming_call(pjsua_acc_id acc, pjsua_call_id cid,
 {
     PJ_UNUSED_ARG(acc);
     PJ_UNUSED_ARG(r);
-    pjsua_call_answer(cid, 200, NULL, NULL);
+    if(!cli_dial)
+        pjsua_call_answer(cid, 200, NULL, NULL);
 }
 
 static void on_call_media_state(pjsua_call_id cid)

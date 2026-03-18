@@ -18,7 +18,7 @@ The reason why this application does not support emulating a AT modem is because
 To use ipv6 instead of ipv4 for sip and rtp transport, just add --ipv6 to the command line
 If you don't want to register to a pbx, just don't set --reg, --user and --pass.
 If --bindport is not set the application will use a random port (not 5060) to bind itself to. If you want some consistency just set this value to something you find appropriate
-You can use --srtp to enable opportunistic srtp, if you call (--dial) or register (--reg) with sips:, srtp will be mandatory
+You can use --srtp to enable opportunistic srtp, if you call (--dial) or register (--reg) with sips: or sip:...;transport=tls, srtp will be mandatory
 
 # How to use it with a PBX
 In doubt see the source code, but in general something like this on the "server" side (as root because of pppd)

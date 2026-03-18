@@ -798,15 +798,21 @@ int main(int argc, char **argv)
     pjsua_transport_config_default(&tcfg);
     tcfg.port = cli_port;
     pj_status_t status;
+
     int transport = T_UDP;
     if(cli_reg && strncmp(cli_reg,"sips:",5)==0)
         transport = T_TLS;
     else if(cli_reg && strcasestr(cli_reg,"transport=tcp")!=NULL)
         transport = T_TCP;
+    else if(cli_reg && strcasestr(cli_reg,"transport=tls")!=NULL)
+        transport = T_TLS;
     else if(cli_dial && strncmp(cli_dial,"sips:",5)==0)
         transport = T_TLS;
     else if(cli_dial && strcasestr(cli_dial,"transport=tcp")!=NULL)
         transport = T_TCP;
+    else if(cli_dial && strcasestr(cli_dial,"transport=tls")!=NULL)
+        transport = T_TLS;
+
     status = pjsua_transport_create(
         (transport==T_UDP?PJSIP_TRANSPORT_UDP:
             (transport==T_TLS?PJSIP_TRANSPORT_TLS:PJSIP_TRANSPORT_TCP)
@@ -836,6 +842,15 @@ int main(int argc, char **argv)
         acc.ipv6_sip_use=PJSUA_IPV6_ENABLED_USE_IPV6_ONLY;
         acc.ipv6_media_use=PJSUA_IPV6_ENABLED_USE_IPV6_ONLY;
     }
+
+    if(cli_srtp) {
+        acc.use_srtp = (transport<2?PJMEDIA_SRTP_OPTIONAL:PJMEDIA_SRTP_MANDATORY);
+        acc.srtp_secure_signaling = 0;
+        pjsua_srtp_opt_default(&acc.srtp_opt);
+        acc.srtp_opt.keying_count=2;
+        acc.srtp_opt.keying[0] = PJMEDIA_SRTP_KEYING_SDES;
+        acc.srtp_opt.keying[1] = PJMEDIA_SRTP_KEYING_DTLS_SRTP;
+    }
     if(cli_reg) {
         acc.reg_uri = pj_str(cli_reg);
         acc.cred_count = 1;
@@ -846,15 +861,6 @@ int main(int argc, char **argv)
         acc.cred_info[0].data = pj_str(cli_pass);
         acc.proxy_cnt = 1;
         acc.proxy[0] = pj_str(cli_reg); // e.g. "sip:pbx.example.com;lr"
-        
-        if(cli_srtp) {
-            acc.use_srtp = (transport<2?PJMEDIA_SRTP_OPTIONAL:PJMEDIA_SRTP_MANDATORY);
-            acc.srtp_secure_signaling = 0;
-            pjsua_srtp_opt_default(&acc.srtp_opt);
-            acc.srtp_opt.keying_count=2;
-            acc.srtp_opt.keying[0] = PJMEDIA_SRTP_KEYING_SDES;
-            acc.srtp_opt.keying[1] = PJMEDIA_SRTP_KEYING_DTLS_SRTP;
-        }
     }
 
     pjsua_acc_id acc_id;

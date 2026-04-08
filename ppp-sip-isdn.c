@@ -1,4 +1,4 @@
-/* clearmode_ppp.c
+/* ppp-sip-isdn.c
  *
  * SIP CLEARMODE (only) <-> HDLC bitstream <-> PPPD
  * Tested API style for PJSIP 2.16
@@ -381,6 +381,11 @@ static void refill_tx(ppp_media_port *p, unsigned minimum)
 
     uint8_t buf[1800];
     memset(buf,0,sizeof(buf));
+    if(sizeof(p->rbuf)-p->rbuf_pos==0) {
+        printf("emergency flush, should never happen if mtu is < 1800\n");
+        p->rbuf_pos=0;
+        memset(p->rbuf,0,sizeof(p->rbuf));
+    }
     ssize_t rn = read(p->link.master_fd, p->rbuf+p->rbuf_pos, sizeof(p->rbuf)-p->rbuf_pos);
 
     if (rn > 0) {
@@ -388,6 +393,7 @@ static void refill_tx(ppp_media_port *p, unsigned minimum)
         // printf("got %d bytes from pppd\n",rn);
         int start = 0;
         int delivered = 0;
+        int lastFrameEnd = 0;
         while (start<rn) {
             //search start of frame
             while (p->rbuf[start]!=0x7e && start < p->rbuf_pos) start++;
@@ -402,23 +408,27 @@ static void refill_tx(ppp_media_port *p, unsigned minimum)
                 p->txfrmcnt++;
                 hdlc_tx_put_flag(&p->tx, p->tx_buf, &p->tx_len, sizeof(p->tx_buf));
             }
+            if(p->rbuf[pos]==0x7e)
+                lastFrameEnd = pos;
             start = pos;
         }
-        // if last frame is not complete
-        if(start<p->rbuf_pos) {
-                if(p->rbuf[start]==0x7e) {
-                    if(p->rbuf_pos-start>1)
-                        memcpy(p->rbuf,p->rbuf+start,p->rbuf_pos-start);
-                    else p->rbuf[0]=0x7e;
-                    p->rbuf_pos=p->rbuf_pos-start;
-                }
+        // if last frame is not complete, move last frame to the beginning of the buffer
+        if(lastFrameEnd<p->rbuf_pos && p->rbuf[lastFrameEnd] == 0x7e) {
+            if(p->rbuf_pos-lastFrameEnd > 1) {
+                memcpy(p->rbuf,p->rbuf+lastFrameEnd,p->rbuf_pos-lastFrameEnd);
+                p->rbuf_pos = p->rbuf_pos-lastFrameEnd;
+            }
+            else {
+                p->rbuf[0] = 0x7e;
+                p->rbuf_pos = 1;
+            }
         }
         // if at least one frame got delivered and all frames are complete, put a start of frame
         // on the beginning so we have start and end the next time.
         // pppd sometimes uses 0x7e as stop and start, this is essentially a workaround
         else if(delivered>0){
-                p->rbuf_pos=1;
-                p->rbuf[0]=0x7e;
+            p->rbuf[0] = 0x7e;
+            p->rbuf_pos = 1;
         }
     }
     // if we have no more data, fill with 0x7e

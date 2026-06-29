@@ -207,6 +207,8 @@ pj_status_t ppp_put_frame(pjmedia_port *port,
     ppp_media_port *p = (ppp_media_port*)port;
 
     int needed = f->size;
+    if(!p->active || p->rx==0)
+        return PJ_SUCCESS;
 
     // 320 means pjsip insists on PCM data.
     if(f->size==320) { //the other end only wrote to the lower half if pjsip runs in PCM mode somewhere
@@ -313,7 +315,12 @@ static pj_status_t ppp_get_frame(pjmedia_port *port,
                                  pjmedia_frame *f)
 {
     ppp_media_port *p = (ppp_media_port*)port;
-
+    if(!p->active || p->tx==0) {
+        memset(f->buf,0x7e,f->size);
+        if(f->size==320)
+            memset(f->buf+160,0x0,160);
+        return PJ_SUCCESS;
+    }
     uint8_t *out = (uint8_t*)f->buf;
     unsigned need = f->size;
     unsigned w = 0;

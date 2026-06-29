@@ -4,7 +4,7 @@ PJSIP_DIR=pjproject
 PKG_CONFIG_PATH=pjsip.install/lib/pkgconfig
 
 APP = ppp-sip-isdn
-SRC = ppp-sip-isdn.c clearmode_codec.c
+SRC = ppp-sip-isdn.c clearmode_codec.c hdlc-bitstream.c
 
 # Adjust if your PJSIP install lives elsewhere
 PJSIP_PREFIX = ./pjsip.install

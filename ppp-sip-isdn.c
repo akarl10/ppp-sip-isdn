@@ -17,6 +17,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include "clearmode_codec.h"
+#include "hdlc-bitstream.h"
 
 #define T_UDP 0
 #define T_TCP 1
@@ -120,137 +121,6 @@ static void stop_pppd(ppp_link *link)
     }
 }
 
-/* ================= HDLC RX (bitstream -> PPP bytes) ================= */
-
-typedef struct {
-    uint64_t bitbuf;
-    int      bitcnt;
-    int      ones;
-    int      in_frame;
-
-    uint8_t  frame_buf[4096];
-    int      frame_len;
-
-    uint8_t  cur_byte;
-    int      cur_bitpos;
-    uint8_t  last8;
-} hdlc_rx_state;
-
-static void hdlc_rx_init(hdlc_rx_state *s)
-{
-    memset(s, 0, sizeof(*s));
-}
-
-typedef void (*hdlc_frame_cb)(const uint8_t*, int, void*);
-
-static void hdlc_rx_push_byte(hdlc_rx_state *s, uint8_t b,
-                              hdlc_frame_cb cb, void *user)
-{
-    s->bitbuf = (s->bitbuf << 8) | b;
-    s->bitcnt += 8;
-    while (s->bitcnt > 0) {
-        int bit = (s->bitbuf >> (s->bitcnt - 1)) & 1;
-        s->bitcnt--;
-
-        s->last8 = ((s->last8 << 1) | bit) & 0xFF;
-
-        if (s->last8 == 0x7E) {
-            s->ones = 0;
-            s->cur_byte = 0;
-            s->cur_bitpos = 0;
-
-            if (s->in_frame && s->frame_len > 0)
-                cb(s->frame_buf, s->frame_len, user);
-
-            s->in_frame = 1;
-            s->frame_len = 0;
-
-            continue;
-        }
-
-        if (!s->in_frame)
-            continue;
-
-        if (bit) {
-            s->ones++;
-        } else {
-            if (s->ones == 5) {
-                s->ones = 0;
-                continue;
-            }
-            s->ones = 0;
-        }
-
-        s->cur_byte = (s->cur_byte >> 1) | (bit?0x80:0);
-        s->cur_bitpos++;
-
-        if (s->cur_bitpos == 8) {
-            if (s->frame_len < (int)sizeof(s->frame_buf))
-                s->frame_buf[s->frame_len++] = s->cur_byte;
-            s->cur_bitpos = 0;
-            s->cur_byte = 0;
-        }
-    }
-}
-
-/* ================= HDLC TX (PPP bytes -> bitstream) ================= */
-
-typedef struct {
-    uint64_t bitbuf;
-    int      bitcnt;
-    int      ones;
-} hdlc_tx_state;
-
-static void hdlc_tx_init(hdlc_tx_state *s)
-{
-    memset(s, 0, sizeof(*s));
-}
-
-static void hdlc_tx_put_bit_raw(hdlc_tx_state *s, int bit,
-                                uint8_t *out, int *out_len, int max)
-{
-    s->bitbuf = (s->bitbuf << 1) | (bit & 1);
-    s->bitcnt++;
-
-    if (s->bitcnt == 8) {
-        if (*out_len < max)
-            out[(*out_len)++] = (uint8_t)s->bitbuf;
-        s->bitbuf = 0;
-        s->bitcnt = 0;
-    }
-}
-
-static void hdlc_tx_put_bit(hdlc_tx_state *s, int bit,
-                            uint8_t *out, int *out_len, int max)
-{
-
-    hdlc_tx_put_bit_raw(s, bit, out, out_len, max);
-    if (bit) {
-        s->ones++;
-        if (s->ones == 5) {
-            hdlc_tx_put_bit_raw(s, 0, out, out_len, max);
-            s->ones = 0;
-        }
-    } else {
-        s->ones = 0;
-    }
-}
-
-static void hdlc_tx_put_byte(hdlc_tx_state *s, uint8_t b,
-                             uint8_t *out, int *out_len, int max)
-{
-    for (int i = 7; i >= 0; --i)
-        hdlc_tx_put_bit(s, ((b << i) & 0x80?1:0), out, out_len, max);
-}
-
-static void hdlc_tx_put_flag(hdlc_tx_state *s,
-                             uint8_t *out, int *out_len, int max)
-{
-    s->ones = 0;
-    for (int i = 7; i >= 0; --i)
-        hdlc_tx_put_bit_raw(s, (0x7E >> i) & 1, out, out_len, max);
-
-}
 
 /* ================= PPP MEDIA PORT ================= */
 
@@ -258,8 +128,8 @@ typedef struct {
     pjmedia_port base;
     ppp_link     link;
 
-    hdlc_rx_state rx;
-    hdlc_tx_state tx;
+    hdlc_rx_state* rx;
+    hdlc_tx_state* tx;
     pj_pool_t *pool;
 
     uint8_t tx_buf[4096];
@@ -347,7 +217,7 @@ pj_status_t ppp_put_frame(pjmedia_port *port,
 
     uint8_t *buf = (uint8_t*)f->buf;
     for (unsigned i = 0; i < needed; ++i) {
-        hdlc_rx_push_byte(&p->rx, buf[i], deliver_ppp_frame, p);
+        hdlc_rx_push_byte(p->rx, buf[i], deliver_ppp_frame, p);
     }
 
     return PJ_SUCCESS;
@@ -403,10 +273,10 @@ static void refill_tx(ppp_media_port *p, unsigned minimum)
             if(pos-start>2 && p->rbuf[start]==0x7e && p->rbuf[pos]==0x7e)  { // if we have a frame
                 int n = ppp_unescape_pppd(p->rbuf+start+1,pos-start-1,buf);
                 for (ssize_t i = 0; i < n; i++)
-                    hdlc_tx_put_byte(&p->tx, buf[i], p->tx_buf, &p->tx_len, sizeof(p->tx_buf));
+                    hdlc_tx_put_byte(p->tx, buf[i], p->tx_buf, &p->tx_len, sizeof(p->tx_buf));
                 delivered++;
                 p->txfrmcnt++;
-                hdlc_tx_put_flag(&p->tx, p->tx_buf, &p->tx_len, sizeof(p->tx_buf));
+                hdlc_tx_put_flag(p->tx, p->tx_buf, &p->tx_len, sizeof(p->tx_buf));
             }
             if(p->rbuf[pos]==0x7e)
                 lastFrameEnd = pos;
@@ -434,7 +304,7 @@ static void refill_tx(ppp_media_port *p, unsigned minimum)
     // if we have no more data, fill with 0x7e
     if (p->tx_len == 0)
         for(unsigned i=0;i<minimum;i++)
-            hdlc_tx_put_flag(&p->tx, p->tx_buf, &p->tx_len, sizeof(p->tx_buf));
+            hdlc_tx_put_flag(p->tx, p->tx_buf, &p->tx_len, sizeof(p->tx_buf));
 }
 
 static pj_status_t ppp_destroy(pjmedia_port *port);
@@ -495,6 +365,12 @@ static pj_status_t ppp_destroy(pjmedia_port *port)
                 pj_pool_release(p->pool);
                 p->pool = NULL;
             }
+            if(p->rx)
+                hdlc_rx_free(p->rx);
+            p->rx=0;
+            if(p->tx)
+                hdlc_tx_free(p->tx);
+            p->tx=0;
         }
     }
     return PJ_SUCCESS;
@@ -522,9 +398,14 @@ static pj_status_t ppp_media_port_reset(const char *pppd_args,
 
     if (start_pppd(&p->link, pppd_args, p->remoteip) != 0)
         return PJ_EUNKNOWN;
-
-    hdlc_rx_init(&p->rx);
-    hdlc_tx_init(&p->tx);
+    if(p->rx)
+        hdlc_rx_free(p->rx);
+    if(p->tx)
+        hdlc_rx_free(p->rx);
+    p->rx = hdlc_rx_new();
+    p->tx = hdlc_tx_new();
+    hdlc_rx_init(p->rx);
+    hdlc_tx_init(p->tx);
 
     return PJ_SUCCESS;
 }
@@ -756,6 +637,8 @@ int main(int argc, char **argv)
     for(int i=0;i<linecount;i++) {
         lines[i].active=0;
         lines[i].pool=NULL;
+        lines[i].rx=0;
+        lines[i].tx=0;
         if(cli_pppremoteipstart) {
             lines[i].remoteip = cli_pppremoteipstart++;
             // don't use .0 and .255. Should be valid ip addresses but might make problems

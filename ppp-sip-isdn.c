@@ -10,6 +10,10 @@
 #define SECURE_PPP_HELPER "/usr/local/sbin/ppp-helper"
 #endif
 
+#ifndef PPPD_PATH
+#define PPPD_PATH "/usr/sbin/pppd"
+#endif
+
 #include <pty.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -28,6 +32,12 @@
 #define T_UDP 0
 #define T_TCP 1
 #define T_TLS 2
+
+typedef enum {
+    LINE_FREE = 0,
+    LINE_ACTIVE = 1,
+    LINE_STOPPING = 2
+} line_state_t;
 /* ================= CLI PARAMS ================= */
 
 static char *cli_id   = NULL;
@@ -79,7 +89,7 @@ static int start_pppd(ppp_link *link, const char *args, uint32_t remoteip)
         if(secure_ppp) {
             char* args [5];
             int strpos = strlen(slave_name)-1;
-            args[0] = "pppd";
+            args[0] = "sip-isdn-pppd";
             while (strpos>=0 && slave_name[strpos]!='/')
                 strpos--;
             if(slave_name[strpos]=='/' && strpos == strlen("/dev/pts")) { //this is very lazy, but the setuid root binary checks validiy of the number
@@ -114,7 +124,7 @@ static int start_pppd(ppp_link *link, const char *args, uint32_t remoteip)
             char *argv[PPPD_MAX_ARGS+1];
             int ac = 0;
 
-            argv[ac++] = "pppd";
+            argv[ac++] = "sip-isdn-pppd"; //let userspace see this one is special
             argv[ac++] = slave_name;
             argv[ac++] = "nodetach";
 
@@ -145,7 +155,7 @@ static int start_pppd(ppp_link *link, const char *args, uint32_t remoteip)
 
             argv[ac] = NULL;
 
-            execv("/usr/sbin/pppd", argv);
+            execv(PPPD_PATH, argv);
             if(have_we)
                 wordfree(&we);
             _exit(1);
@@ -162,9 +172,35 @@ static int start_pppd(ppp_link *link, const char *args, uint32_t remoteip)
 static void stop_pppd(ppp_link *link)
 {
     if (link->pid > 0) {
-        kill(link->pid, SIGTERM);
-        waitpid(link->pid, NULL, 0);
-        link->pid = 0;
+        if(secure_ppp) {
+            pid_t pid = fork();
+            if (pid < 0) {
+                perror("fork");
+                return;
+            }
+
+            if (pid == 0) {
+                char term_pid [32];
+                char* args [4];
+                snprintf(term_pid,sizeof(term_pid),"%d",link->pid);
+                args[0]=SECURE_PPP_HELPER;
+                args[1]="stop";
+                args[2]=term_pid;
+                args[3]=NULL;
+                char *envp[] = {
+                    NULL
+                };
+                execve(SECURE_PPP_HELPER, args,envp);
+                printf("calling secure pppd terminate failed\n");
+                exit (1);
+            }
+            else {
+                waitpid(pid,NULL,0);
+            }
+        }
+        else {
+            kill(link->pid, SIGHUP);
+        }
     }
     if (link->master_fd >= 0) {
         close(link->master_fd);
@@ -192,7 +228,7 @@ typedef struct {
     uint64_t rxfrmcnt;
     uint64_t txfrmcnt;
     uint32_t remoteip;
-    uint8_t active;
+    line_state_t state;
     pjsua_conf_port_id ppp_conf_id;
 
 } ppp_media_port;
@@ -243,7 +279,7 @@ static void deliver_ppp_frame(const uint8_t *data, int len, void *user)
     //do this only on the first packet. the first time there will never arrive 2 at the same time
     if(cli_dial && p->rxfrmcnt==1) {
         for(int i=0;i<linecount;i++) {
-            if(!lines[i].active) {
+            if(lines[i].state==LINE_FREE) {
                 pj_str_t dialstr = pj_str(cli_dial);
                 pjsua_call_info ci;
                 pjsua_call_get_info(p->call, &ci);
@@ -262,7 +298,7 @@ pj_status_t ppp_put_frame(pjmedia_port *port,
     ppp_media_port *p = (ppp_media_port*)port;
 
     int needed = f->size;
-    if(!p->active || p->rx==0)
+    if(p->state==LINE_FREE || p->rx==0)
         return PJ_SUCCESS;
 
     // 320 means pjsip insists on PCM data.
@@ -372,7 +408,7 @@ static pj_status_t ppp_get_frame(pjmedia_port *port,
                                  pjmedia_frame *f)
 {
     ppp_media_port *p = (ppp_media_port*)port;
-    if(!p->active || p->tx==0) {
+    if(p->state==LINE_FREE || p->tx==0) {
         memset(f->buf,0x7e,f->size);
         if(f->size==320)
             memset(f->buf+160,0x0,160);
@@ -383,15 +419,15 @@ static pj_status_t ppp_get_frame(pjmedia_port *port,
     unsigned w = 0;
     int ppp_status;
     if((waitpid(p->link.pid, &ppp_status, WNOHANG)) != 0) {
+        p->link.pid = 0; // already down, no need to send HUP to pppd
         pjsua_call_hangup(p->call,0,NULL,NULL);
         f->size=0;
         f->type = PJMEDIA_FRAME_TYPE_AUDIO;
-        p->link.pid = 0;
         printf("PPP Line went down\n");
         ppp_destroy(port);
         int activecnt = 0;
         for(int i=0;i<linecount;i++) {
-            activecnt += (lines[i].active?1:0);
+            activecnt += (lines[i].state!=LINE_FREE?1:0);
         }
         if(cli_dial && activecnt == 0)
             terminate = 1;
@@ -423,9 +459,9 @@ static pj_status_t ppp_destroy(pjmedia_port *port)
     ppp_media_port *p = (ppp_media_port*)port;
     stop_pppd(&p->link);
     for(int i=0;i<linecount;i++) {
-        if(lines+i == p && lines[i].active) {
+        if(lines+i == p && lines[i].state == LINE_ACTIVE) {
             pjsua_conf_remove_port(lines[i].ppp_conf_id);
-            lines[i].active = 0;
+            lines[i].state = (p->link.pid>0?LINE_STOPPING:LINE_FREE);
         }
     }
     return PJ_SUCCESS;
@@ -449,7 +485,7 @@ static pj_status_t ppp_media_port_reset(const char *pppd_args,
     p->rbuf_pos       = 0;
     p->txfrmcnt       = 0;
     p->rxfrmcnt       = 0;
-    p->active         = 1;
+    p->state         = LINE_ACTIVE;
 
     if (start_pppd(&p->link, pppd_args, p->remoteip) != 0)
         return PJ_EUNKNOWN;
@@ -511,7 +547,7 @@ static void on_call_media_state(pjsua_call_id cid)
         }
         
         for(int i=0;i<linecount;i++) {
-            if(!lines[i].active) {
+            if(lines[i].state==LINE_FREE) {
                 ppp = &(lines[i]);
                 i=linecount;
             }
@@ -555,12 +591,12 @@ static void on_call_state(pjsua_call_id cid, pjsip_event *e)
         ppp = (void*)pjsua_call_get_user_data(cid);
         int activecnt = 0;
         if(ppp) {
-            if(ppp->active) {
+            if(ppp->state == LINE_ACTIVE) {
                 ppp_destroy((pjmedia_port *)ppp);
             }
         }
         for(int i=0;i<linecount;i++) {
-            activecnt += (lines[i].active?1:0);
+            activecnt += (lines[i].state!=LINE_FREE?1:0);
         }
         if(cli_dial && activecnt == 0)
             terminate = 1;
@@ -672,7 +708,7 @@ int main(int argc, char **argv)
 
     pjsua_create();
     for(int i=0;i<linecount;i++) {
-        lines[i].active=0;
+        lines[i].state=LINE_FREE;
         lines[i].rx=hdlc_rx_new();
         lines[i].tx=hdlc_tx_new();
         char poolname[PJ_MAX_OBJ_NAME];
@@ -819,8 +855,25 @@ int main(int argc, char **argv)
         printf("Waiting for incoming CLEARMODE data call...\n");
     }
 
-    while(!terminate)
+    while(!terminate) {
         pj_thread_sleep(1000);
+        int activecnt = 0;
+        for(int i=0;i<linecount;i++) {
+            if(lines[i].state==LINE_STOPPING) {
+                int ppp_status;
+                if((waitpid(lines[i].link.pid, &ppp_status, WNOHANG)) != 0) {
+                    printf("pppd terminated on line %d after disconnect\n", i);
+                    lines[i].link.pid=0;
+                    lines[i].state=LINE_FREE;
+                }
+            }
+            if(lines[i].state!=LINE_FREE)
+                activecnt++;
+        }
+        if(cli_dial && activecnt == 0)
+            terminate = 1;
+    }
+
     for(int i=0;i<linecount;i++) {
         hdlc_tx_free(lines[i].tx);
         hdlc_rx_free(lines[i].rx);

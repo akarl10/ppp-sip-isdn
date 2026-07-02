@@ -18,7 +18,9 @@
 #include <fcntl.h>
 #include "clearmode_codec.h"
 #include "hdlc-bitstream.h"
+#include <wordexp.h>
 
+#define PPPD_MAX_ARGS 64
 #define T_UDP 0
 #define T_TCP 1
 #define T_TLS 2
@@ -70,34 +72,42 @@ static int start_pppd(ppp_link *link, const char *args, uint32_t remoteip)
         setsid();
         close(slave_fd);
 
-        char *argv[64];
+        char *argv[PPPD_MAX_ARGS+1];
         int ac = 0;
+
         argv[ac++] = "pppd";
         argv[ac++] = slave_name;
 
-        char *tmp = strdup(args);
-        char *tok = strtok(tmp, " ");
-        while (tok && ac < 63) {
-            argv[ac++] = tok;
-            tok = strtok(NULL, " ");
-        }
         char localremote[128]; // 8*3(digits) + 3*2 (.) + 1 (:) + 1 (\0), 32 bytes, but compiler complains
-        if(remoteip || cli_ppplocalip) {
+        if((remoteip || cli_ppplocalip) && ac < PPPD_MAX_ARGS) {
             localremote[0]=0;
             char l[62];
             char r[62];
             if(cli_ppplocalip) {
-                sprintf(l,"%u.%u.%u.%u",(cli_ppplocalip&0xff000000)>>24,(cli_ppplocalip&0xff0000)>>16,(cli_ppplocalip&0xff00)>>8,(cli_ppplocalip&0xff));
+                snprintf(l,sizeof(l),"%u.%u.%u.%u",(cli_ppplocalip&0xff000000)>>24,(cli_ppplocalip&0xff0000)>>16,(cli_ppplocalip&0xff00)>>8,(cli_ppplocalip&0xff));
             }
+            else l[0]=0;
             if(remoteip) {
-                sprintf(r,"%u.%u.%u.%u",(remoteip&0xff000000)>>24,(remoteip&0xff0000)>>16,(remoteip&0xff00)>>8,(remoteip&0xff));
+                snprintf(r,sizeof(r),"%u.%u.%u.%u",(remoteip&0xff000000)>>24,(remoteip&0xff0000)>>16,(remoteip&0xff00)>>8,(remoteip&0xff));
             }
-            sprintf(localremote,"%s:%s",l,r);
+            else r[0]=0;
+            snprintf(localremote,sizeof(localremote),"%s:%s",l,r);
             argv[ac++] = localremote;
         }
+
+        wordexp_t we;
+        int have_we = 0;
+        if (args && wordexp(args, &we, WRDE_NOCMD) == 0) {
+            have_we = 1;
+            for (size_t i = 0; i < we.we_wordc && ac<PPPD_MAX_ARGS; i++)
+                argv[ac++] = we.we_wordv[i];
+        }
+
         argv[ac] = NULL;
 
-        execvp("pppd", argv);
+        execv("/usr/sbin/pppd", argv);
+        if(have_we)
+            wordfree(&we);
         _exit(1);
     }
 
@@ -152,19 +162,22 @@ size_t ppp_escape_pppd(const uint8_t *in, size_t in_len, uint8_t *out, size_t ma
 
     while (i < in_len) {
         if (in[i] == 0x7E) {            // FLAG byte
+            if(max_len<j+2) return j;
             out[j++] = 0x7D;
             out[j++] = 0x5E;
         } else if (in[i] == 0x7D) {     // ESCAPE byte
+            if(max_len<j+2) return j;
             out[j++] = 0x7D;
             out[j++] = 0x5D;
         } else if (in[i]<0x20) {
+            if(max_len<j+2) return j;
             out[j++] = 0x7D;
             out[j++] = in[i] ^ 0x20; // put this in clear for now
         } else {
+            if(max_len<j+1) return j;
             out[j++] = in[i];
         }
         i++;
-        if(max_len<j) return j;
     }
     return j; // number of bytes written to out[]
 }
@@ -528,28 +541,10 @@ static void on_call_state(pjsua_call_id cid, pjsip_event *e)
 
 static uint32_t parseip(const char* ipparam)
 {
-    uint32_t ip = 0;
-    int p = 0;
-    int l=0;
-    char nb[4];
-    nb[0]=0;
-    while(ipparam[p]!='\0') {
-        if(l>3) {// wrong ip format
-            return 0;
-        }
-        if(ipparam[p]!='.') {
-            nb[l]=ipparam[p];
-            nb[l+1]='\0';
-            l++;
-        }
-        if (ipparam[p+1]=='\0' || ipparam[p]=='.') {
-            ip = (ip << 8) | atoi(nb);
-            l=0;
-            nb[0]='\0';
-        }
-        p++;
-    }
-    return ip;
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ipparam, &addr) != 1)
+        return 0;
+    return ntohl(addr.s_addr);
 }
 
 static void parse_cli(int argc, char **argv)

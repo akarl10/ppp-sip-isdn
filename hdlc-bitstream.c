@@ -55,7 +55,7 @@ void hdlc_rx_push_byte(hdlc_rx_state *s, uint8_t b,
             s->cur_byte = 0;
             s->cur_bitpos = 0;
 
-            if (s->in_frame && s->frame_len > 0)
+            if (cb && s->in_frame && s->frame_len > 0)
                 cb(s->frame_buf, s->frame_len, user);
 
             s->in_frame = 1;

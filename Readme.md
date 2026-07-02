@@ -20,6 +20,8 @@ If you don't want to register to a pbx, just don't set --reg, --user and --pass.
 If --bindport is not set the application will use a random port (not 5060) to bind itself to. If you want some consistency just set this value to something you find appropriate
 You can use --srtp to enable opportunistic srtp, if you call (--dial) or register (--reg) with sips: or sip:...;transport=tls, srtp will be mandatory
 
+*Fritz!Box note:*
+CLEARMODE does not work when calling directly from an internal SIP extension to the Fritz!Box's internal S0 bus. The call must be routed through a PBX where the Fritz!Box is registered as a SIP client or trunk.
 
 # Recommendation for non-root invocation
 
@@ -38,6 +40,12 @@ The helper always uses the PPP options file:
 PPP parameters should be configured there. IP addresses are provided by
 `ppp-sip-isdn` and therefore must not be specified in that file.
 
+a options.isdn file for a dialin server might be something like
+```
+mp
+proxyarp
+```
+
 The helper binary must be installed as:
 
     /usr/local/libexec/ppp-sip-isdn/ppp-helper
@@ -53,6 +61,7 @@ chown root:dip /usr/local/libexec/ppp-sip-isdn/ppp-helper
 chmod 4750 /usr/local/libexec/ppp-sip-isdn/ppp-helper
 ```
 
+
 The helper validates:
 
 the requested PTY belongs to the invoking user,
@@ -64,12 +73,12 @@ To authorize termination of a PPPD instance, the helper verifies:
 - the process executable matches the configured PPPD path,
 - the process was started with the helper-specific `argv[0]` identifier,
 - the PTY used by the PPPD instance still belongs to the invoking user.
-
+    
 No user-supplied PPP options are passed to pppd; the executable path,
 configuration file and command-line arguments are fixed by the helper.
 
 # How to use it with a PBX
-In doubt see the source code, but in general something like this on the "server" side (as root because of pppd)
+In doubt see the source code, but in general something like this on the "server" side
 ```bash
 # user must be member of dip, see above
 ppp-sip-isdn --loglevel 1 --id sip:number@pbx.server --reg sip:pbx.server --user number --pass XXXXXXXXXXX --bindport 44444 --ppplocalip 10.0.1.1 --pppremoteipstart 10.0.1.2 --linecount 8
@@ -78,7 +87,7 @@ ppp-sip-isdn --loglevel 1 --id sip:number@pbx.server --reg sip:pbx.server --user
 and on the "client" (channel bind 2 calls, as root because of pppd)
 ```bash
 #as root because of pppd, else put every parameter in /etc/ppp/options.isdn and leave --pppd and run as user, must be member of group dip in that case
-ppp-sip-isdn --loglevel 1 --id sip:number@pbx.server --reg sip:pbx.server --user number --pass XXXXXXXXXXX --pppd "noauth user myuser password mypassword mp" --bindport 44443 --linecount 2 --dial sip:dialinnumber@pbx.server
+sudo ppp-sip-isdn --loglevel 1 --id sip:number@pbx.server --reg sip:pbx.server --user number --pass XXXXXXXXXXX --pppd "noauth user myuser password mypassword mp" --bindport 44443 --linecount 2 --dial sip:dialinnumber@pbx.server
 ```
 # How to use it in a P2P configuration without any security
 one one side (server)
@@ -99,3 +108,24 @@ git submodule init
 git submodule update
 make
 ```
+
+### Help wanted: Cisco BRI setup documentation
+
+I am looking for help from someone familiar with Cisco IOS voice gateways and ISDN BRI interfaces to create a setup guide for using a Cisco router as an ISDN-to-SIP CLEARMODE gateway for ppp-sip-isdn.
+
+The goal is:
+``` 
+ Retro PC with ISDN card
+        ↓
+ ISDN S0 bus
+        ↓
+ Cisco router (voice-enabled + BRI card)
+        ↓
+ SIP CLEARMODE (RFC4040)
+        ↓
+ ppp-sip-isdn
+```
+
+Such a setup would make ppp-sip-isdn much more practical for retrocomputing enthusiasts, since Cisco voice routers with BRI interfaces are relatively common on the second-hand market and are often already owned by people interested in legacy networking and ISDN.
+
+If you have experience configuring Cisco voice gateways, dial peers, and CLEARMODE/RFC4040 transport, contributions, configuration examples, or testing are highly appreciated.

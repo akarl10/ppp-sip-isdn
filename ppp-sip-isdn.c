@@ -6,6 +6,10 @@
 
 #include <pjsua-lib/pjsua.h>
 
+#ifndef SECURE_PPP_HELPER
+#define SECURE_PPP_HELPER "/usr/local/sbin/ppp-helper"
+#endif
+
 #include <pty.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -40,6 +44,7 @@ static int terminate = 0;
 static int linecount = 1;
 static int cli_ip6 = 0;
 static int cli_srtp = 0;
+static int secure_ppp = 0;
 
 /* ================= PPPD VIA PTY ================= */
 
@@ -71,44 +76,80 @@ static int start_pppd(ppp_link *link, const char *args, uint32_t remoteip)
         close(master_fd);
         setsid();
         close(slave_fd);
-
-        char *argv[PPPD_MAX_ARGS+1];
-        int ac = 0;
-
-        argv[ac++] = "pppd";
-        argv[ac++] = slave_name;
-
-        char localremote[128]; // 8*3(digits) + 3*2 (.) + 1 (:) + 1 (\0), 32 bytes, but compiler complains
-        if((remoteip || cli_ppplocalip) && ac < PPPD_MAX_ARGS) {
-            localremote[0]=0;
-            char l[62];
-            char r[62];
-            if(cli_ppplocalip) {
-                snprintf(l,sizeof(l),"%u.%u.%u.%u",(cli_ppplocalip&0xff000000)>>24,(cli_ppplocalip&0xff0000)>>16,(cli_ppplocalip&0xff00)>>8,(cli_ppplocalip&0xff));
+        if(secure_ppp) {
+            char* args [5];
+            int strpos = strlen(slave_name)-1;
+            args[0] = "pppd";
+            while (strpos>=0 && slave_name[strpos]!='/')
+                strpos--;
+            if(slave_name[strpos]=='/' && strpos == strlen("/dev/pts")) { //this is very lazy, but the setuid root binary checks validiy of the number
+                strpos ++;
+                char* end = 0;
+                char *envp[] = {
+                    NULL
+                };
+                strtol(slave_name + strpos,&end,10);
+                if(end && *end=='\0') {
+                    char r[62];
+                    char l[62];
+                    args[1]=slave_name + strpos;
+                    if(cli_ppplocalip) {
+                        snprintf(l,sizeof(l),"%u.%u.%u.%u",(cli_ppplocalip&0xff000000)>>24,(cli_ppplocalip&0xff0000)>>16,(cli_ppplocalip&0xff00)>>8,(cli_ppplocalip&0xff));
+                        args[2]=l;
+                    }
+                    else args[2]="";
+                    if(remoteip) {
+                        snprintf(r,sizeof(r),"%u.%u.%u.%u",(remoteip&0xff000000)>>24,(remoteip&0xff0000)>>16,(remoteip&0xff00)>>8,(remoteip&0xff));
+                        args[3]=r;
+                    }
+                    else args[3]="";
+                    args[4]=0;
+                    execve(SECURE_PPP_HELPER, args,envp);
+                    printf("calling secure pppd failed\n");
+                }
             }
-            else l[0]=0;
-            if(remoteip) {
-                snprintf(r,sizeof(r),"%u.%u.%u.%u",(remoteip&0xff000000)>>24,(remoteip&0xff0000)>>16,(remoteip&0xff00)>>8,(remoteip&0xff));
+            exit(1);
+        }
+        else {
+            char *argv[PPPD_MAX_ARGS+1];
+            int ac = 0;
+
+            argv[ac++] = "pppd";
+            argv[ac++] = slave_name;
+            argv[ac++] = "nodetach";
+
+            char localremote[128]; // 8*3(digits) + 3*2 (.) + 1 (:) + 1 (\0), 32 bytes, but compiler complains
+            if((remoteip || cli_ppplocalip) && ac < PPPD_MAX_ARGS) {
+                localremote[0]=0;
+                char l[62];
+                char r[62];
+                if(cli_ppplocalip) {
+                    snprintf(l,sizeof(l),"%u.%u.%u.%u",(cli_ppplocalip&0xff000000)>>24,(cli_ppplocalip&0xff0000)>>16,(cli_ppplocalip&0xff00)>>8,(cli_ppplocalip&0xff));
+                }
+                else l[0]=0;
+                if(remoteip) {
+                    snprintf(r,sizeof(r),"%u.%u.%u.%u",(remoteip&0xff000000)>>24,(remoteip&0xff0000)>>16,(remoteip&0xff00)>>8,(remoteip&0xff));
+                }
+                else r[0]=0;
+                snprintf(localremote,sizeof(localremote),"%s:%s",l,r);
+                argv[ac++] = localremote;
             }
-            else r[0]=0;
-            snprintf(localremote,sizeof(localremote),"%s:%s",l,r);
-            argv[ac++] = localremote;
+
+            wordexp_t we;
+            int have_we = 0;
+            if (args && wordexp(args, &we, WRDE_NOCMD) == 0) {
+                have_we = 1;
+                for (size_t i = 0; i < we.we_wordc && ac<PPPD_MAX_ARGS; i++)
+                    argv[ac++] = we.we_wordv[i];
+            }
+
+            argv[ac] = NULL;
+
+            execv("/usr/sbin/pppd", argv);
+            if(have_we)
+                wordfree(&we);
+            _exit(1);
         }
-
-        wordexp_t we;
-        int have_we = 0;
-        if (args && wordexp(args, &we, WRDE_NOCMD) == 0) {
-            have_we = 1;
-            for (size_t i = 0; i < we.we_wordc && ac<PPPD_MAX_ARGS; i++)
-                argv[ac++] = we.we_wordv[i];
-        }
-
-        argv[ac] = NULL;
-
-        execv("/usr/sbin/pppd", argv);
-        if(have_we)
-            wordfree(&we);
-        _exit(1);
     }
 
     close(slave_fd);
@@ -547,7 +588,10 @@ static void parse_cli(int argc, char **argv)
             memset(argv[i],'X',strlen(cli_pass));
         }
         else if (!strcmp(argv[i], "--dial")) cli_dial = argv[++i];
-        else if (!strcmp(argv[i], "--pppd")) cli_pppd = argv[++i];
+        else if (!strcmp(argv[i], "--pppd")) {
+            cli_pppd = argv[++i];
+            secure_ppp = 0;
+        }
         else if (!strcmp(argv[i], "--bindport")) cli_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--loglevel")) cli_loglevel = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--linecount")) linecount = atoi(argv[++i]);
@@ -619,6 +663,7 @@ static void configure_dns_resolver(pjsua_config* cfg,pj_pool_t* pjsua_pool) {
 
 int main(int argc, char **argv)
 {
+    secure_ppp = 1;
     parse_cli(argc, argv);
 
     lines = calloc(sizeof(ppp_media_port),linecount);

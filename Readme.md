@@ -20,19 +20,53 @@ If you don't want to register to a pbx, just don't set --reg, --user and --pass.
 If --bindport is not set the application will use a random port (not 5060) to bind itself to. If you want some consistency just set this value to something you find appropriate
 You can use --srtp to enable opportunistic srtp, if you call (--dial) or register (--reg) with sips: or sip:...;transport=tls, srtp will be mandatory
 
-# recommandation for non-root invocation
-if you do not use the pppd option a helper binary will be used to spawn pppd. This helper is a setuid root binary that has most of the parameters hardcoded.
-This however allows ppp-sip-isdn to run as user. For a dialin server this is strongly suggested
 
-there is a helper binary that hard-codes the option file /etc/ppp/options.isdn. here you put you ppp parameters (except ip)
-this binary must be placed to /usr/local/libexec/ppp-sip-isdn/ppp-helper (see Makefile)
-owned by root and a group you allow this to run:
+# Recommendation for non-root invocation
+
+If the `--pppd` option is not used, a helper binary is employed to start
+`pppd`. This helper is a small setuid-root program with most parameters
+hard-coded.
+
+Using the helper allows `ppp-sip-isdn` itself to run as an unprivileged
+user. For dial-in server deployments this is strongly recommended, since
+the SIP stack and media processing do not require root privileges.
+
+The helper always uses the PPP options file:
+
+    /etc/ppp/options.isdn
+
+PPP parameters should be configured there. IP addresses are provided by
+`ppp-sip-isdn` and therefore must not be specified in that file.
+
+The helper binary must be installed as:
+
+    /usr/local/libexec/ppp-sip-isdn/ppp-helper
+
+(see the Makefile).
+
+A typical installation is:
+
 ```bash
-install /usr/local/libexec/ppp-sip-isdn/ppp-helper ppp-helper
-chown root:dip
+install ppp-helper /usr/local/libexec/ppp-sip-isdn/ppp-helper
+#Only members of the dip group will then be permitted to start or stop PPP sessions through the helper.
+chown root:dip /usr/local/libexec/ppp-sip-isdn/ppp-helper
 chmod 4750 /usr/local/libexec/ppp-sip-isdn/ppp-helper
 ```
 
+The helper validates:
+
+the requested PTY belongs to the invoking user,
+local and remote IP addresses are syntactically valid
+
+To authorize termination of a PPPD instance, the helper verifies:
+
+- the specified PID exists,
+- the process executable matches the configured PPPD path,
+- the process was started with the helper-specific `argv[0]` identifier,
+- the PTY used by the PPPD instance still belongs to the invoking user.
+
+No user-supplied PPP options are passed to pppd; the executable path,
+configuration file and command-line arguments are fixed by the helper.
 
 # How to use it with a PBX
 In doubt see the source code, but in general something like this on the "server" side (as root because of pppd)

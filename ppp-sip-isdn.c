@@ -152,6 +152,7 @@ typedef struct {
     uint64_t txfrmcnt;
     uint32_t remoteip;
     uint8_t active;
+    pjsua_conf_port_id ppp_conf_id;
 
 } ppp_media_port;
 
@@ -279,13 +280,15 @@ static void refill_tx(ppp_media_port *p, unsigned minimum)
         int start = 0;
         int delivered = 0;
         int lastFrameEnd = 0;
-        while (start<rn) {
+        while (start<p->rbuf_pos) {
             //search start of frame
-            while (p->rbuf[start]!=0x7e && start < p->rbuf_pos) start++;
+            while (start < p->rbuf_pos && p->rbuf[start]!=0x7e) start++;
             int pos = start+1;
             //search end of frame
-            while (p->rbuf[pos]!=0x7e && pos < p->rbuf_pos) pos++;
-            if(pos-start>2 && p->rbuf[start]==0x7e && p->rbuf[pos]==0x7e)  { // if we have a frame
+            while (pos < p->rbuf_pos && p->rbuf[pos]!=0x7e) pos++;
+            if(pos < p->rbuf_pos &&
+                pos-start>2 && p->rbuf[start]==0x7e && 
+                p->rbuf[pos]==0x7e)  { // if we have a frame
                 int n = ppp_unescape_pppd(p->rbuf+start+1,pos-start-1,buf);
                 for (ssize_t i = 0; i < n; i++)
                     hdlc_tx_put_byte(p->tx, buf[i], p->tx_buf, &p->tx_len, sizeof(p->tx_buf));
@@ -293,14 +296,14 @@ static void refill_tx(ppp_media_port *p, unsigned minimum)
                 p->txfrmcnt++;
                 hdlc_tx_put_flag(p->tx, p->tx_buf, &p->tx_len, sizeof(p->tx_buf));
             }
-            if(p->rbuf[pos]==0x7e)
+            if(pos < p->rbuf_pos && p->rbuf[pos]==0x7e)
                 lastFrameEnd = pos;
             start = pos;
         }
         // if last frame is not complete, move last frame to the beginning of the buffer
         if(lastFrameEnd<p->rbuf_pos && p->rbuf[lastFrameEnd] == 0x7e) {
             if(p->rbuf_pos-lastFrameEnd > 1) {
-                memcpy(p->rbuf,p->rbuf+lastFrameEnd,p->rbuf_pos-lastFrameEnd);
+                memmove(p->rbuf,p->rbuf+lastFrameEnd,p->rbuf_pos-lastFrameEnd);
                 p->rbuf_pos = p->rbuf_pos-lastFrameEnd;
             }
             else {
@@ -379,18 +382,9 @@ static pj_status_t ppp_destroy(pjmedia_port *port)
     ppp_media_port *p = (ppp_media_port*)port;
     stop_pppd(&p->link);
     for(int i=0;i<linecount;i++) {
-        if(lines+i == p) {
+        if(lines+i == p && lines[i].active) {
+            pjsua_conf_remove_port(lines[i].ppp_conf_id);
             lines[i].active = 0;
-            if(p->pool) {
-                pj_pool_release(p->pool);
-                p->pool = NULL;
-            }
-            if(p->rx)
-                hdlc_rx_free(p->rx);
-            p->rx=0;
-            if(p->tx)
-                hdlc_tx_free(p->tx);
-            p->tx=0;
         }
     }
     return PJ_SUCCESS;
@@ -418,14 +412,13 @@ static pj_status_t ppp_media_port_reset(const char *pppd_args,
 
     if (start_pppd(&p->link, pppd_args, p->remoteip) != 0)
         return PJ_EUNKNOWN;
-    if(p->rx)
-        hdlc_rx_free(p->rx);
-    if(p->tx)
-        hdlc_rx_free(p->rx);
-    p->rx = hdlc_rx_new();
-    p->tx = hdlc_tx_new();
-    hdlc_rx_init(p->rx);
-    hdlc_tx_init(p->tx);
+    if(!p->rx)
+        return PJ_ENOMEM;
+    if(!p->tx)
+        return PJ_ENOMEM;
+
+    hdlc_rx_init(p->rx); //reset
+    hdlc_tx_init(p->tx); //reset
 
     return PJ_SUCCESS;
 }
@@ -489,10 +482,7 @@ static void on_call_media_state(pjsua_call_id cid)
         }
         
         if(!ppp->pool) {
-            char poolname[PJ_MAX_OBJ_NAME];
-            memset(poolname,0,PJ_MAX_OBJ_NAME);
-            snprintf(poolname,PJ_MAX_OBJ_NAME-1,"mp-%lx",(long unsigned int)ppp);
-            ppp->pool = pjsua_pool_create(poolname, 512, 512);
+            return;
         }
         pjsua_conf_port_id call_conf = pjsua_call_get_conf_port(cid);
 
@@ -503,11 +493,10 @@ static void on_call_media_state(pjsua_call_id cid)
         }
         ppp->call = cid;
 
-        pjsua_conf_port_id ppp_conf;
-        pjsua_conf_add_port(ppp->pool, &ppp->base, &ppp_conf);
+        pjsua_conf_add_port(ppp->pool, &ppp->base, &ppp->ppp_conf_id);
 
-        pjsua_conf_connect(call_conf, ppp_conf);
-        pjsua_conf_connect(ppp_conf, call_conf);
+        pjsua_conf_connect(call_conf, ppp->ppp_conf_id);
+        pjsua_conf_connect(ppp->ppp_conf_id, call_conf);
         pjsua_call_set_user_data(cid, ppp);
         printf("PPP bridge active (CLEARMODE only)\n");
     }
@@ -636,11 +625,15 @@ int main(int argc, char **argv)
     if(!lines)
         exit(1);
 
+    pjsua_create();
     for(int i=0;i<linecount;i++) {
         lines[i].active=0;
-        lines[i].pool=NULL;
-        lines[i].rx=0;
-        lines[i].tx=0;
+        lines[i].rx=hdlc_rx_new();
+        lines[i].tx=hdlc_tx_new();
+        char poolname[PJ_MAX_OBJ_NAME];
+        memset(poolname,0,PJ_MAX_OBJ_NAME);
+        snprintf(poolname,PJ_MAX_OBJ_NAME-1,"mp-%lx",(long unsigned int)i);
+        lines[i].pool = pjsua_pool_create(poolname, 512, 512);
         if(cli_pppremoteipstart) {
             lines[i].remoteip = cli_pppremoteipstart++;
             // don't use .0 and .255. Should be valid ip addresses but might make problems
@@ -648,7 +641,6 @@ int main(int argc, char **argv)
             if ((lines[i].remoteip%256)==0) lines[i].remoteip = cli_pppremoteipstart++;
         }
     }
-    pjsua_create();
 
     pjsua_config cfg;
     pjsua_logging_config log;
@@ -784,6 +776,11 @@ int main(int argc, char **argv)
 
     while(!terminate)
         pj_thread_sleep(1000);
+    for(int i=0;i<linecount;i++) {
+        hdlc_tx_free(lines[i].tx);
+        hdlc_rx_free(lines[i].rx);
+        pj_pool_release(lines[i].pool);
+    }
     pj_pool_release(pjsua_pool);
 }
 

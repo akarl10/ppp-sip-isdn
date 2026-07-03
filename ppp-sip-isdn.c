@@ -36,7 +36,8 @@
 typedef enum {
     LINE_FREE = 0,
     LINE_ACTIVE = 1,
-    LINE_STOPPING = 2
+    LINE_STOPPING = 2,
+    LINE_RESERVED_DIALOUT = 3
 } line_state_t;
 /* ================= CLI PARAMS ================= */
 
@@ -551,6 +552,10 @@ static void on_call_media_state(pjsua_call_id cid)
                 ppp = &(lines[i]);
                 i=linecount;
             }
+            else if(cli_dial && lines[i].state==LINE_RESERVED_DIALOUT) {
+                ppp = &(lines[i]);
+                i=linecount;
+            }
         }
         if(!ppp) {
             printf("no free line found\n");
@@ -596,11 +601,12 @@ static void on_call_state(pjsua_call_id cid, pjsip_event *e)
             }
         }
         for(int i=0;i<linecount;i++) {
-            activecnt += (lines[i].state!=LINE_FREE?1:0);
+            activecnt += (lines[i].state!=LINE_FREE&&lines[i].state!=LINE_RESERVED_DIALOUT?1:0);
         }
         if(cli_dial && activecnt == 0)
             terminate = 1;
     }
+
 }
 
 /* ================= CLI PARSER ================= */
@@ -842,6 +848,7 @@ int main(int argc, char **argv)
         wait_for_registration(acc_id);
 
     if (cli_dial) {
+        lines[0].state=LINE_RESERVED_DIALOUT;
         printf("Dialing (CLEARMODE only) %s\n", cli_dial);
         pj_str_t dialstr = pj_str(cli_dial);
         pjsua_call_id current_call = PJSUA_INVALID_ID;

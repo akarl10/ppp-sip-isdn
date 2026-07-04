@@ -59,13 +59,13 @@ You can simply register your dialin server with freeswitch like this:
 
 ```bash
 #freeswitch domain is freeswitch.local in this example
-ppp-sip-isdn --id sip:1001@freeswitch.local --reg sip:freeswitch.local --user 1001 --pass secret-of-that-user --bind 15060
+env SIP_PASS=secret ppp-sip-isdn --id sip:1001@freeswitch.local --reg sip:freeswitch.local --user 1001 --bind 15060
 ```
 
 the client dialing works like this
 ```bash
 #freeswitch domain is freeswitch.local in this example
-ppp-sip-isdn --id sip:1002@freeswitch.local --reg sip:freeswitch.local --user 1002 --pass secret-of-that-user --dial sip:1001@freeswitch.local --bind 25060
+env SIP_PASS=secret ppp-sip-isdn --id sip:1002@freeswitch.local --reg sip:freeswitch.local --user 1002 --dial sip:1001@freeswitch.local --bind 25060
 ```
 
 using `--bind` is recommended to not have to wait old registrations to timeout on the freeswitch side, but not strictly required

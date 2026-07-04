@@ -317,10 +317,10 @@ pj_status_t ppp_put_frame(pjmedia_port *port,
     return PJ_SUCCESS;
 }
 
-size_t ppp_unescape_pppd(const uint8_t *in, size_t in_len, uint8_t *out) {
+size_t ppp_unescape_pppd(const uint8_t *in, size_t in_len, uint8_t *out, size_t max_out_len) {
     size_t i = 0, j = 0;
 
-    while (i < in_len) {
+    while (i < in_len && j < max_out_len) {
         if (in[i] == 0x7D) {            // Escape byte
             if (i + 1 < in_len) {       // Ensure next byte exists
                 out[j++] = in[i + 1] ^ 0x20;
@@ -367,7 +367,7 @@ static void refill_tx(ppp_media_port *p, unsigned minimum)
             if(pos < p->rbuf_pos &&
                 pos-start>2 && p->rbuf[start]==0x7e && 
                 p->rbuf[pos]==0x7e)  { // if we have a frame
-                int n = ppp_unescape_pppd(p->rbuf+start+1,pos-start-1,buf);
+                int n = ppp_unescape_pppd(p->rbuf+start+1,pos-start-1,buf,sizeof(buf));
                 for (ssize_t i = 0; i < n; i++)
                     hdlc_tx_put_byte(p->tx, buf[i], p->tx_buf, &p->tx_len, sizeof(p->tx_buf));
                 delivered++;
@@ -624,8 +624,14 @@ static void parse_cli(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--id"))   cli_id   = argv[++i];
         else if (!strcmp(argv[i], "--reg"))  cli_reg  = argv[++i];
-        else if (!strcmp(argv[i], "--user")) cli_user = argv[++i];
+        else if (!strcmp(argv[i], "--user")) {
+            cli_user = argv[++i];
+            if(getenv("SIP_PASS")!=0)
+                cli_pass = strdup(getenv("SIP_PASS"));
+        }
         else if (!strcmp(argv[i], "--pass")) {
+            if(cli_pass)
+                free(cli_pass);
             cli_pass = strdup(argv[++i]);
             memset(argv[i],'X',strlen(cli_pass));
         }
@@ -645,7 +651,7 @@ static void parse_cli(int argc, char **argv)
 
     if (!cli_id || (cli_reg && (!cli_user || !cli_pass))) {
         fprintf(stderr,
-            "Required: --id, --user and --pass if --reg\n");
+            "Required: --id, --user and --pass if --reg. --pass might be also set by the environment variable SIP_PASS\n");
         exit(1);
     }
 

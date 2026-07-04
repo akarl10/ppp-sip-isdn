@@ -81,13 +81,13 @@ configuration file and command-line arguments are fixed by the helper.
 In doubt see the source code, but in general something like this on the "server" side
 ```bash
 # user must be member of dip, see above
-ppp-sip-isdn --loglevel 1 --id sip:number@pbx.server --reg sip:pbx.server --user number --pass XXXXXXXXXXX --bindport 44444 --ppplocalip 10.0.1.1 --pppremoteipstart 10.0.1.2 --linecount 8
+env SIP_PASS=secret ppp-sip-isdn --loglevel 1 --id sip:number@pbx.server --reg sip:pbx.server --user number --bindport 44444 --ppplocalip 10.0.1.1 --pppremoteipstart 10.0.1.2 --linecount 8
 ```
 
 and on the "client" (channel bind 2 calls, as root because of pppd)
 ```bash
 #as root because of pppd, else put every parameter in /etc/ppp/options.isdn and leave --pppd and run as user, must be member of group dip in that case
-sudo ppp-sip-isdn --loglevel 1 --id sip:number@pbx.server --reg sip:pbx.server --user number --pass XXXXXXXXXXX --pppd "noauth user myuser password mypassword mp" --bindport 44443 --linecount 2 --dial sip:dialinnumber@pbx.server
+sudo env SIP_PASS=secret ppp-sip-isdn --loglevel 1 --id sip:number@pbx.server --reg sip:pbx.server --user number --pppd "noauth user myuser password mypassword mp" --bindport 44443 --linecount 2 --dial sip:dialinnumber@pbx.server
 ```
 # How to use it in a P2P configuration without any security
 one one side (server)

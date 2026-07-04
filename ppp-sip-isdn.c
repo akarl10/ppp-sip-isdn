@@ -203,7 +203,7 @@ static void stop_pppd(ppp_link *link)
             kill(link->pid, SIGHUP);
         }
     }
-    if (link->master_fd >= 0) {
+    else if (link->master_fd >= 0) {
         close(link->master_fd);
         link->master_fd = -1;
     }
@@ -299,7 +299,7 @@ pj_status_t ppp_put_frame(pjmedia_port *port,
     ppp_media_port *p = (ppp_media_port*)port;
 
     int needed = f->size;
-    if(p->state==LINE_FREE || p->rx==0)
+    if((p->state!=LINE_ACTIVE && p->state!=LINE_STOPPING) || p->rx==0)
         return PJ_SUCCESS;
 
     // 320 means pjsip insists on PCM data.
@@ -409,7 +409,7 @@ static pj_status_t ppp_get_frame(pjmedia_port *port,
                                  pjmedia_frame *f)
 {
     ppp_media_port *p = (ppp_media_port*)port;
-    if(p->state==LINE_FREE || p->tx==0) {
+    if((p->state!=LINE_ACTIVE && p->state!=LINE_STOPPING)|| p->tx==0) {
         memset(f->buf,0x7e,f->size);
         if(f->size==320)
             memset(f->buf+160,0x0,160);
@@ -717,6 +717,8 @@ int main(int argc, char **argv)
         lines[i].state=LINE_FREE;
         lines[i].rx=hdlc_rx_new();
         lines[i].tx=hdlc_tx_new();
+        lines[i].link.master_fd=-1;
+        lines[i].link.pid=0;
         char poolname[PJ_MAX_OBJ_NAME];
         memset(poolname,0,PJ_MAX_OBJ_NAME);
         snprintf(poolname,PJ_MAX_OBJ_NAME-1,"mp-%lx",(long unsigned int)i);
@@ -872,6 +874,10 @@ int main(int argc, char **argv)
                     printf("pppd terminated on line %d after disconnect\n", i);
                     lines[i].link.pid=0;
                     lines[i].state=LINE_FREE;
+                    if(lines[i].link.master_fd>=0) {
+                        close(lines[i].link.master_fd);
+                        lines[i].link.master_fd=-1;
+                    }
                 }
             }
             if(lines[i].state!=LINE_FREE)

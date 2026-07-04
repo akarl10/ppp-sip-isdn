@@ -1,4 +1,4 @@
-# What is that for
+# Freeswitch howto
 
 This directory contains a modified version of the deprecated mod_clearmode that implements CLEARMODE transcoding/repacketization to handle different ptime values between call legs.
 
@@ -54,3 +54,22 @@ a XML dialplan snipped modified from the default one that worked for me is the f
 </extension>
 ```
 the relevant part is `<condition field="${switch_r_sdp}" expression="CLEARMODE/8000" break="never">`. you may not need anti-action, I just use this to allow t38 fax renegotiation on my extensions
+
+You can simply register your dialin server with freeswitch like this:
+
+```bash
+#freeswitch domain is freeswitch.local in this example
+ppp-sip-isdn --id sip:1001@freeswitch.local --reg sip:freeswitch.local --user 1001 --pass secret-of-that-user --bind 15060
+```
+
+the client dialing works like this
+```bash
+#freeswitch domain is freeswitch.local in this example
+ppp-sip-isdn --id sip:1002@freeswitch.local --reg sip:freeswitch.local --user 1002 --pass secret-of-that-user --dial sip:1001@freeswitch.local --bind 25060
+```
+
+using `--bind` is recommended to not have to wait old registrations to timeout on the freeswitch side, but not strictly required
+
+# using vanilla freeswitch
+if you want to pass CLEARMODE without the need for the mod_clearmode (upstream does not have this anymore), bypass_media or proxy_media might work, but I had no luck, at least with proxy_media.
+I have not tried bybass_media because on my test system one host was on ipv6, the other ipv4 so that would never work in bypass_media mode

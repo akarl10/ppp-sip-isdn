@@ -778,6 +778,7 @@ int main(int argc, char **argv)
 
     media.clock_rate = 8000;
     media.snd_clock_rate = 8000;
+    media.no_vad = 1;
     
     if(cli_srtp) {
         cfg.use_srtp = PJMEDIA_SRTP_OPTIONAL;

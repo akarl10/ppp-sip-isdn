@@ -298,20 +298,16 @@ pj_status_t ppp_put_frame(pjmedia_port *port,
 {
     ppp_media_port *p = (ppp_media_port*)port;
 
-    int needed = f->size;
+    int needed = f->size/2;
     if((p->state!=LINE_ACTIVE && p->state!=LINE_STOPPING) || p->rx==0)
         return PJ_SUCCESS;
 
-    // 320 means pjsip insists on PCM data.
-    if(f->size==320) { //the other end only wrote to the lower half if pjsip runs in PCM mode somewhere
-        needed = 160;
-    }
     if (f->type != PJMEDIA_FRAME_TYPE_AUDIO || f->size == 0)
         return PJ_SUCCESS;
 
-    uint8_t *buf = (uint8_t*)f->buf;
+    uint16_t *buf = (uint16_t*)f->buf;
     for (unsigned i = 0; i < needed; ++i) {
-        hdlc_rx_push_byte(p->rx, buf[i], deliver_ppp_frame, p);
+        hdlc_rx_push_byte(p->rx, buf[i] & 0xff, deliver_ppp_frame, p);
     }
 
     return PJ_SUCCESS;
@@ -411,12 +407,10 @@ static pj_status_t ppp_get_frame(pjmedia_port *port,
     ppp_media_port *p = (ppp_media_port*)port;
     if((p->state!=LINE_ACTIVE && p->state!=LINE_STOPPING)|| p->tx==0) {
         memset(f->buf,0x7e,f->size);
-        if(f->size==320)
-            memset(f->buf+160,0x0,160);
         return PJ_SUCCESS;
     }
-    uint8_t *out = (uint8_t*)f->buf;
-    unsigned need = f->size;
+    uint16_t *out = (uint16_t*)f->buf;
+    unsigned need = f->size/2;
     unsigned w = 0;
     int ppp_status;
     if((waitpid(p->link.pid, &ppp_status, WNOHANG)) != 0) {
@@ -434,10 +428,7 @@ static pj_status_t ppp_get_frame(pjmedia_port *port,
             terminate = 1;
         return PJ_SUCCESS;
     }
-    if(need==320) { //just write the lower 160bytes. if we do the same on both sides it should work
-        need=160;
-        memset(out+160,0x0,160);
-    }
+
 
     while (w < need) {
         if (p->tx_pos >= p->tx_len)
@@ -445,12 +436,13 @@ static pj_status_t ppp_get_frame(pjmedia_port *port,
 
         unsigned avail = p->tx_len - p->tx_pos;
         unsigned chunk = (need - w < avail) ? (need - w) : avail;
-
-        memcpy(out + w, p->tx_buf + p->tx_pos, chunk);
+        for(int i = 0;i<chunk;i++) {
+            out[w + i]=(p->tx_buf[p->tx_pos + i] & 0xff);
+        }
         p->tx_pos += chunk;
         w += chunk;
     }
-    // f->size = w;
+
     f->type = PJMEDIA_FRAME_TYPE_AUDIO;
     return PJ_SUCCESS;
 }

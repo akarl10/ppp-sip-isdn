@@ -270,8 +270,7 @@ static pj_status_t clearmode_codec_encode(pjmedia_codec *codec,
 {
     PJ_UNUSED_ARG(codec);
 
-
-    if (input->size > output_buf_len)
+    if (input->size/2 > output_buf_len)
         return PJMEDIA_CODEC_EFRMTOOSHORT;
 
     if (input->type != PJMEDIA_FRAME_TYPE_AUDIO) {
@@ -280,8 +279,13 @@ static pj_status_t clearmode_codec_encode(pjmedia_codec *codec,
         return PJ_SUCCESS;
     }
 
-    pj_memcpy(output->buf, input->buf, input->size/2); // we write to the lower part
-    output->size      = input->size/2;
+    int bytecount = input->size/2;
+    uint16_t* in = input->buf;
+    uint8_t* out = output->buf;
+    for(int i=0;i<bytecount;i++)
+        out[i]=in[i]&0xff;
+
+    output->size      = bytecount;
     output->type      = PJMEDIA_FRAME_TYPE_AUDIO;
     output->timestamp = input->timestamp;
 
@@ -294,8 +298,7 @@ static pj_status_t clearmode_codec_decode(pjmedia_codec *codec,
                                 pjmedia_frame *output)
 {
     PJ_UNUSED_ARG(codec);
-
-    if (input->size > output_buf_len)
+    if (input->size*2 > output_buf_len)
         return PJMEDIA_CODEC_EFRMTOOSHORT;
 
     if (input->type != PJMEDIA_FRAME_TYPE_AUDIO) {
@@ -304,13 +307,15 @@ static pj_status_t clearmode_codec_decode(pjmedia_codec *codec,
         return PJ_SUCCESS;
     }
 
-    pj_memcpy(output->buf, input->buf, input->size); // we write to the lower part
-    // printf("junk: %s\n",output->buf);
-    memset(output->buf+input->size,0,input->size);
+    int bytecount = input->size;
+    uint8_t* in = input->buf;
+    uint16_t* out = output->buf;
+    for(int i=0;i<bytecount;i++)
+        out[i]=in[i] & 0xff;
+
     output->size      = input->size*2;
     output->type      = PJMEDIA_FRAME_TYPE_AUDIO;
     output->timestamp = input->timestamp;
-
     return PJ_SUCCESS;
 }
 

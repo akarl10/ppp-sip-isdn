@@ -33,6 +33,8 @@
 #define T_TCP 1
 #define T_TLS 2
 
+#include <pjmedia/alaw_ulaw.h>
+
 typedef enum {
     LINE_FREE = 0,
     LINE_ACTIVE = 1,
@@ -56,6 +58,7 @@ static int linecount = 1;
 static int cli_ip6 = 0;
 static int cli_srtp = 0;
 static int secure_ppp = 0;
+static int cli_voice_bearer = 0;
 
 /* ================= PPPD VIA PTY ================= */
 
@@ -307,7 +310,10 @@ pj_status_t ppp_put_frame(pjmedia_port *port,
 
     uint16_t *buf = (uint16_t*)f->buf;
     for (unsigned i = 0; i < needed; ++i) {
-        hdlc_rx_push_byte(p->rx, buf[i] & 0xff, deliver_ppp_frame, p);
+        if(!cli_voice_bearer)
+            hdlc_rx_push_byte(p->rx, buf[i] & 0xff, deliver_ppp_frame, p);
+        else
+            hdlc_rx_push_byte(p->rx, pjmedia_linear2alaw(buf[i]), deliver_ppp_frame, p);
     }
 
     return PJ_SUCCESS;
@@ -437,7 +443,10 @@ static pj_status_t ppp_get_frame(pjmedia_port *port,
         unsigned avail = p->tx_len - p->tx_pos;
         unsigned chunk = (need - w < avail) ? (need - w) : avail;
         for(int i = 0;i<chunk;i++) {
-            out[w + i]=(p->tx_buf[p->tx_pos + i] & 0xff);
+            if(!cli_voice_bearer)
+                out[w + i]=(p->tx_buf[p->tx_pos + i] & 0xff);
+            else
+                out[w + i]=pjmedia_alaw2linear(p->tx_buf[p->tx_pos + i]);
         }
         p->tx_pos += chunk;
         w += chunk;
@@ -513,6 +522,25 @@ static void force_clearmode_only(void)
         }
     }
 }
+
+static void force_pcma_only(void)
+{
+    unsigned count = 64;
+    pjsua_codec_info ci[64];
+
+    if (pjsua_enum_codecs(ci, &count) != PJ_SUCCESS)
+        return;
+
+    for (unsigned i = 0; i < count; ++i) {
+        pj_str_t name = ci[i].codec_id;
+        if (pj_strnicmp2(&name, "PCMA", 4) == 0) {
+            pjsua_codec_set_priority(&ci[i].codec_id, PJMEDIA_CODEC_PRIO_HIGHEST);
+        } else {
+            pjsua_codec_set_priority(&ci[i].codec_id, 0);
+        }
+    }
+}
+
 
 /* ================= PJSUA CALLBACKS ================= */
 
@@ -639,6 +667,7 @@ static void parse_cli(int argc, char **argv)
         else if (!strcmp(argv[i], "--ppplocalip")) cli_ppplocalip = parseip(argv[++i]);
         else if (!strcmp(argv[i], "--ipv6")) cli_ip6=1;
         else if (!strcmp(argv[i], "--srtp")) cli_srtp=1;
+        else if (!strcmp(argv[i], "--pcma")) cli_voice_bearer=1;
     }
 
     if (!cli_id || (cli_reg && (!cli_user || !cli_pass))) {
@@ -767,7 +796,10 @@ int main(int argc, char **argv)
     pjmedia_codec_clearmode_init(endpt);
 
     /* Force CLEARMODE as the only offered codec */
-    force_clearmode_only();
+    if(!cli_voice_bearer)
+        force_clearmode_only();
+    else
+        force_pcma_only();
 
     pjsua_transport_config tcfg;
     pjsua_transport_config_default(&tcfg);
@@ -849,7 +881,7 @@ int main(int argc, char **argv)
 
     if (cli_dial) {
         lines[0].state=LINE_RESERVED_DIALOUT;
-        printf("Dialing (CLEARMODE only) %s\n", cli_dial);
+        printf("Dialing %s\n", cli_dial);
         pj_str_t dialstr = pj_str(cli_dial);
         pjsua_call_id current_call = PJSUA_INVALID_ID;
         pjsua_call_setting call_settings;
@@ -859,7 +891,7 @@ int main(int argc, char **argv)
         call_settings.txt_cnt = 0; // Ensure this is zero to prevent m=text
         pjsua_call_make_call(acc_id, &dialstr, &call_settings, NULL, NULL, &current_call);
     } else {
-        printf("Waiting for incoming CLEARMODE data call...\n");
+        printf("Waiting for incoming data call...\n");
     }
 
     while(!terminate) {

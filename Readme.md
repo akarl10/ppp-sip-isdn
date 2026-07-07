@@ -129,3 +129,12 @@ The goal is:
 Such a setup would make ppp-sip-isdn much more practical for retrocomputing enthusiasts, since Cisco voice routers with BRI interfaces are relatively common on the second-hand market and are often already owned by people interested in legacy networking and ISDN.
 
 If you have experience configuring Cisco voice gateways, dial peers, and CLEARMODE/RFC4040 transport, contributions, configuration examples, or testing are highly appreciated.
+
+### non-standard PCMA mode
+
+Since PCMA over RTP consumes the same bandwidth as CLEARMODE, the same payload can be transmitted as PCMA as far as the telephony stack is concerned.
+Naturally, the stack must not perform any audio processing on the stream. If it leaves the audio untouched, this mode can be used to create a 64 kbps peer-to-peer data channel.
+This approach is entirely proprietary, likely never saw use in real-world systems, and is admittedly a bit of a hack. Its primary purpose is to test connectivity through PBXs that would otherwise refuse CLEARMODE calls.
+As a bonus, Wireshark can now let you hear what CLEARMODE would sound like. 🙂
+
+simply pass `--pcma` on both ends

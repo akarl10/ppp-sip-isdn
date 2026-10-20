@@ -41,8 +41,17 @@ typedef enum {
     LINE_FREE = 0,
     LINE_ACTIVE = 1,
     LINE_STOPPING = 2,
-    LINE_RESERVED_DIALOUT = 3
+    LINE_RESERVED_DIALOUT = 3,
+    LINE_PENDING_START = 4   /* call has media, main loop still has to bring the line up */
 } line_state_t;
+
+/* Line state and the pppd_exited/call_ended flags are shared between pjsip's
+ * media clock and worker threads and the main loop. Every access goes through
+ * these: a release store publishes everything written before it (e.g. the
+ * call id and user data, before a line becomes LINE_PENDING_START), and the
+ * matching acquire load makes it visible to the reader. */
+#define SHARED_LOAD(x)      __atomic_load_n(&(x), __ATOMIC_ACQUIRE)
+#define SHARED_STORE(x, v)  __atomic_store_n(&(x), (v), __ATOMIC_RELEASE)
 /* ================= CLI PARAMS ================= */
 
 static char *cli_id   = NULL;
@@ -250,8 +259,8 @@ typedef struct {
     uint32_t remoteip;
     line_state_t state;
     pjsua_conf_port_id ppp_conf_id;
-    volatile int pppd_exited; /* set by media thread, handled by main loop */
-    volatile int call_ended;  /* set by pjsip callback, handled by main loop */
+    int pppd_exited;     /* set by media thread, handled by main loop */
+    int call_ended;     /* set by pjsip callback, handled by main loop */
 
 } ppp_media_port;
 
@@ -301,7 +310,7 @@ static void deliver_ppp_frame(const uint8_t *data, int len, void *user)
     //do this only on the first packet. the first time there will never arrive 2 at the same time
     if(cli_dial && p->rxfrmcnt==1) {
         for(int i=0;i<linecount;i++) {
-            if(lines[i].state==LINE_FREE) {
+            if(SHARED_LOAD(lines[i].state)==LINE_FREE) {
                 pj_str_t dialstr = pj_str(cli_dial);
                 pjsua_call_info ci;
                 pjsua_call_get_info(p->call, &ci);
@@ -312,9 +321,9 @@ static void deliver_ppp_frame(const uint8_t *data, int len, void *user)
                 call_settings.vid_cnt = 0;
                 call_settings.txt_cnt = 0;
                 printf("\n\n----ADDING LINE %d----\n\n",i+1);
-                lines[i].state = LINE_RESERVED_DIALOUT; /* claim it so it isn't picked twice */
+                SHARED_STORE(lines[i].state, LINE_RESERVED_DIALOUT); /* claim it so it isn't picked twice */
                 if (pjsua_call_make_call(ci.acc_id, &dialstr, &call_settings, NULL, NULL, &current_call) != PJ_SUCCESS)
-                    lines[i].state = LINE_FREE;
+                    SHARED_STORE(lines[i].state, LINE_FREE);
                 break;
             }
         }
@@ -327,7 +336,7 @@ pj_status_t ppp_put_frame(pjmedia_port *port,
     ppp_media_port *p = (ppp_media_port*)port;
 
     unsigned needed = f->size/2;
-    if((p->state!=LINE_ACTIVE && p->state!=LINE_STOPPING) || p->rx==0)
+    if((SHARED_LOAD(p->state)!=LINE_ACTIVE && SHARED_LOAD(p->state)!=LINE_STOPPING) || p->rx==0)
         return PJ_SUCCESS;
 
     if (f->type != PJMEDIA_FRAME_TYPE_AUDIO || f->size == 0)
@@ -436,7 +445,7 @@ static pj_status_t ppp_get_frame(pjmedia_port *port,
                                  pjmedia_frame *f)
 {
     ppp_media_port *p = (ppp_media_port*)port;
-    if((p->state!=LINE_ACTIVE && p->state!=LINE_STOPPING)|| p->tx==0) {
+    if((SHARED_LOAD(p->state)!=LINE_ACTIVE && SHARED_LOAD(p->state)!=LINE_STOPPING)|| p->tx==0) {
         memset(f->buf,0x7e,f->size);
         return PJ_SUCCESS;
     }
@@ -444,11 +453,11 @@ static pj_status_t ppp_get_frame(pjmedia_port *port,
     unsigned need = f->size/2;
     unsigned w = 0;
     int ppp_status;
-    if(p->pppd_exited ||
+    if(SHARED_LOAD(p->pppd_exited) ||
        (p->link.pid > 0 && waitpid(p->link.pid, &ppp_status, WNOHANG) != 0)) {
         /* Don't tear down from the media thread: the main loop hangs up
          * the call and removes the port (see handle_pppd_exit). */
-        p->pppd_exited = 1;
+        SHARED_STORE(p->pppd_exited, 1);
         memset(f->buf,0x7e,f->size);
         f->type = PJMEDIA_FRAME_TYPE_AUDIO;
         return PJ_SUCCESS;
@@ -480,9 +489,9 @@ static pj_status_t ppp_destroy(pjmedia_port *port)
     ppp_media_port *p = (ppp_media_port*)port;
     stop_pppd(&p->link);
     for(int i=0;i<linecount;i++) {
-        if(lines+i == p && lines[i].state == LINE_ACTIVE) {
+        if(lines+i == p && SHARED_LOAD(lines[i].state) == LINE_ACTIVE) {
             pjsua_conf_remove_port(lines[i].ppp_conf_id);
-            lines[i].state = (p->link.pid>0?LINE_STOPPING:LINE_FREE);
+            SHARED_STORE(lines[i].state, (p->link.pid>0?LINE_STOPPING:LINE_FREE));
         }
     }
     return PJ_SUCCESS;
@@ -506,9 +515,8 @@ static pj_status_t ppp_media_port_reset(const char *pppd_args,
     p->rbuf_pos       = 0;
     p->txfrmcnt       = 0;
     p->rxfrmcnt       = 0;
-    p->state         = LINE_ACTIVE;
-    p->pppd_exited   = 0;
-    p->call_ended    = 0;
+    SHARED_STORE(p->state, LINE_ACTIVE);
+    SHARED_STORE(p->pppd_exited, 0);
 
     if (start_pppd(&p->link, pppd_args, p->remoteip) != 0)
         return PJ_EUNKNOWN;
@@ -528,10 +536,33 @@ static void handle_pppd_exit(ppp_media_port *p)
 {
     printf("PPP Line went down\n");
     p->link.pid = 0; // already down, no need to send HUP to pppd
-    p->pppd_exited = 0;
+    SHARED_STORE(p->pppd_exited, 0);
     pjsua_call_hangup(p->call,0,NULL,NULL);
-    if (p->state == LINE_ACTIVE)
+    if (SHARED_LOAD(p->state) == LINE_ACTIVE)
         ppp_destroy((pjmedia_port *)p);
+}
+
+/* Main loop: bring up a line whose call just got its media (see on_call_media_state) */
+static void start_line(ppp_media_port *ppp)
+{
+    pjsua_call_id cid = ppp->call;
+
+    if (SHARED_LOAD(ppp->call_ended) || !pjsua_call_is_active(cid)) {
+        SHARED_STORE(ppp->state, LINE_FREE);
+        return;
+    }
+    pjsua_conf_port_id call_conf = pjsua_call_get_conf_port(cid);
+
+    if (ppp_media_port_reset(cli_pppd, ppp) != PJ_SUCCESS) {
+        printf("PPP port failed\n");
+        SHARED_STORE(ppp->state, LINE_FREE);
+        pjsua_call_hangup(cid,0,NULL,NULL);
+        return;
+    }
+    pjsua_conf_add_port(ppp->pool, &ppp->base, &ppp->ppp_conf_id);
+    pjsua_conf_connect(call_conf, ppp->ppp_conf_id);
+    pjsua_conf_connect(ppp->ppp_conf_id, call_conf);
+    printf("PPP bridge active (%s)\n", cli_voice_bearer ? "PCMA" : "CLEARMODE only");
 }
 
 /* ================= CLEARMODE ONLY SETUP ================= */
@@ -602,11 +633,11 @@ static void on_call_media_state(pjsua_call_id cid)
         /* dial-out calls own a reserved line; prefer it over any free one */
         if(cli_dial) {
             for(int i=0;i<linecount && !ppp;i++)
-                if(lines[i].state==LINE_RESERVED_DIALOUT)
+                if(SHARED_LOAD(lines[i].state)==LINE_RESERVED_DIALOUT)
                     ppp = &(lines[i]);
         }
         for(int i=0;i<linecount && !ppp;i++) {
-            if(lines[i].state==LINE_FREE)
+            if(SHARED_LOAD(lines[i].state)==LINE_FREE)
                 ppp = &(lines[i]);
         }
         if(!ppp) {
@@ -618,21 +649,15 @@ static void on_call_media_state(pjsua_call_id cid)
         if(!ppp->pool) {
             return;
         }
-        pjsua_conf_port_id call_conf = pjsua_call_get_conf_port(cid);
-
-        if (ppp_media_port_reset(cli_pppd, ppp) != PJ_SUCCESS) {
-            printf("PPP port failed\n");
-            pjsua_call_hangup(cid,0,NULL,NULL);
-            return;
-        }
+        /* Only claim the line here. This runs on pjsip's worker thread, which
+         * also receives RTP for all other lines, so the slow part (opening the
+         * pty, spawning pppd, adding the conference port) is left to the main
+         * loop, see start_line(). */
         ppp->call = cid;
-
-        pjsua_conf_add_port(ppp->pool, &ppp->base, &ppp->ppp_conf_id);
-
-        pjsua_conf_connect(call_conf, ppp->ppp_conf_id);
-        pjsua_conf_connect(ppp->ppp_conf_id, call_conf);
+        SHARED_STORE(ppp->call_ended, 0);
+        SHARED_STORE(ppp->pppd_exited, 0);
         pjsua_call_set_user_data(cid, ppp);
-        printf("PPP bridge active (CLEARMODE only)\n");
+        SHARED_STORE(ppp->state, LINE_PENDING_START);
     }
 }
 
@@ -671,20 +696,20 @@ static void on_call_state(pjsua_call_id cid, pjsip_event *e)
              * all other lines: don't fork/wait/lock here, the main loop does
              * the teardown (a few ms of blocking is enough to starve the
              * jitter buffers of the other lines). */
-            if(ppp->state == LINE_ACTIVE)
-                ppp->call_ended = 1;
+            if(SHARED_LOAD(ppp->state) == LINE_ACTIVE || SHARED_LOAD(ppp->state) == LINE_PENDING_START)
+                SHARED_STORE(ppp->call_ended, 1);
         }
         else if(cli_dial) {
             /* call failed before media came up: release its reserved line */
             for(int i=0;i<linecount;i++) {
-                if(lines[i].state==LINE_RESERVED_DIALOUT) {
-                    lines[i].state = LINE_FREE;
+                if(SHARED_LOAD(lines[i].state)==LINE_RESERVED_DIALOUT) {
+                    SHARED_STORE(lines[i].state, LINE_FREE);
                     break;
                 }
             }
         }
         for(int i=0;i<linecount;i++) {
-            activecnt += (lines[i].state!=LINE_FREE&&lines[i].state!=LINE_RESERVED_DIALOUT?1:0);
+            activecnt += (SHARED_LOAD(lines[i].state)!=LINE_FREE&&SHARED_LOAD(lines[i].state)!=LINE_RESERVED_DIALOUT?1:0);
         }
         if(cli_dial && activecnt == 0)
             terminate = 1;
@@ -812,7 +837,7 @@ int main(int argc, char **argv)
 
     pjsua_create();
     for(int i=0;i<linecount;i++) {
-        lines[i].state=LINE_FREE;
+        SHARED_STORE(lines[i].state, LINE_FREE);
         lines[i].rx=hdlc_rx_new();
         lines[i].tx=hdlc_tx_new();
         lines[i].link.master_fd=-1;
@@ -950,7 +975,7 @@ int main(int argc, char **argv)
         wait_for_registration(acc_id);
 
     if (cli_dial) {
-        lines[0].state=LINE_RESERVED_DIALOUT;
+        SHARED_STORE(lines[0].state, LINE_RESERVED_DIALOUT);
         printf("Dialing %s\n", cli_dial);
         pj_str_t dialstr = pj_str(cli_dial);
         pjsua_call_id current_call = PJSUA_INVALID_ID;
@@ -965,26 +990,28 @@ int main(int argc, char **argv)
     }
 
     while(!terminate) {
-        pj_thread_sleep(250);
+        pj_thread_sleep(20);
         int activecnt = 0;
         for(int i=0;i<linecount;i++) {
-            if(lines[i].state==LINE_ACTIVE && lines[i].pppd_exited)
+            if(SHARED_LOAD(lines[i].state)==LINE_PENDING_START)
+                start_line(&lines[i]);
+            if(SHARED_LOAD(lines[i].state)==LINE_ACTIVE && SHARED_LOAD(lines[i].pppd_exited))
                 handle_pppd_exit(&lines[i]);
-            else if(lines[i].state==LINE_ACTIVE && lines[i].call_ended)
+            else if(SHARED_LOAD(lines[i].state)==LINE_ACTIVE && SHARED_LOAD(lines[i].call_ended))
                 ppp_destroy((pjmedia_port *)&lines[i]);
-            if(lines[i].state==LINE_STOPPING) {
+            if(SHARED_LOAD(lines[i].state)==LINE_STOPPING) {
                 int ppp_status;
                 if((waitpid(lines[i].link.pid, &ppp_status, WNOHANG)) != 0) {
                     printf("pppd terminated on line %d after disconnect\n", i);
                     lines[i].link.pid=0;
-                    lines[i].state=LINE_FREE;
+                    SHARED_STORE(lines[i].state, LINE_FREE);
                     if(lines[i].link.master_fd>=0) {
                         close(lines[i].link.master_fd);
                         lines[i].link.master_fd=-1;
                     }
                 }
             }
-            if(lines[i].state!=LINE_FREE)
+            if(SHARED_LOAD(lines[i].state)!=LINE_FREE)
                 activecnt++;
         }
         if(cli_dial && activecnt == 0)
@@ -994,18 +1021,18 @@ int main(int argc, char **argv)
     /* clean shutdown: drop calls, stop pppd instances, wait briefly for them */
     pjsua_call_hangup_all();
     for(int i=0;i<linecount;i++) {
-        if(lines[i].state==LINE_ACTIVE)
+        if(SHARED_LOAD(lines[i].state)==LINE_ACTIVE)
             ppp_destroy((pjmedia_port *)&lines[i]);
     }
     for(int t=0;t<20;t++) {
         int pending = 0;
         for(int i=0;i<linecount;i++) {
-            if(lines[i].state==LINE_STOPPING) {
+            if(SHARED_LOAD(lines[i].state)==LINE_STOPPING) {
                 if(lines[i].link.pid>0 && waitpid(lines[i].link.pid, NULL, WNOHANG) == 0)
                     pending++;
                 else {
                     lines[i].link.pid = 0;
-                    lines[i].state = LINE_FREE;
+                    SHARED_STORE(lines[i].state, LINE_FREE);
                 }
             }
         }

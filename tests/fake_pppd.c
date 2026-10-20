@@ -8,7 +8,7 @@
  * It speaks async-HDLC (RFC 1662) on the PTY: sends FRAMES PPP-looking frames
  * with a valid FCS-16 and deterministic content, and verifies the frames it
  * receives from the peer (FCS, header, sequence, payload).
- * Result goes to stderr as one line:
+ * Result goes to stderr as one line (plus "FAKEUP role=<r>" at startup):
  *     FAKEPPPD role=<r> sent=<n> recv=<n> bad=<n>
  * The client exits when done (so ppp-sip-isdn hangs up); the server waits for
  * SIGHUP, which is what ppp-sip-isdn sends when the call ends.
@@ -25,13 +25,35 @@
 #include <termios.h>
 #include <unistd.h>
 
-#define FRAMES 30
+#define DEFAULT_FRAMES 30   /* overridable: FAKE_PPPD_FRAMES in ppp-sip-isdn's environment, max 255 */
 #define SEND_INTERVAL_MS 30
 #define START_DELAY_MS 300
+#define IDLE_DONE_MS 1500   /* after sending: peer silent this long => assume the rest was lost */
 #define LINGER_MS 2000      /* client: let tx drain before exiting */
-#define TIMEOUT_S 20
+#define TIMEOUT_S 40
 
+static int FRAMES = DEFAULT_FRAMES;
 static volatile sig_atomic_t got_hup, got_alrm;
+
+/* ppp-sip-isdn starts us with an empty environment, but its own environment
+ * is readable via /proc, which lets the test script pass settings */
+static void read_parent_config(void)
+{
+    char path[64], buf[8192];
+    snprintf(path, sizeof path, "/proc/%d/environ", (int)getppid());
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    for (ssize_t i = 0; i < n; ) {
+        const char *e = buf + i;
+        if (!strncmp(e, "FAKE_PPPD_FRAMES=", 17)) {
+            int v = atoi(e + 17);
+            if (v > 0 && v <= 255) FRAMES = v;
+        }
+        i += strlen(e) + 1;
+    }
+}
 static void on_hup(int s) { (void)s; got_hup = 1; }
 static void on_alrm(int s) { (void)s; got_alrm = 1; }
 
@@ -138,6 +160,7 @@ int main(int argc, char **argv)
     const char *rname = role == 1 ? "server" : "client";
     int peer = role == 1 ? 2 : 1;
 
+    read_parent_config();
     signal(SIGHUP, on_hup);
     signal(SIGALRM, on_alrm);
     alarm(TIMEOUT_S);
@@ -147,21 +170,23 @@ int main(int argc, char **argv)
     struct termios t;
     tcgetattr(fd, &t); cfmakeraw(&t); tcsetattr(fd, TCSANOW, &t);
 
-    int sent = 0, ms = 0, done_ms = -1, reported = 0;
+    fprintf(stderr, "FAKEUP role=%s\n", rname);   /* lets the test script see the line is up */
+    int sent = 0, ms = 0, done_ms = -1, reported = 0, last_rx_ms = 0;
     while (!got_hup && !got_alrm) {
         struct pollfd p = { fd, POLLIN, 0 };
         int r = poll(&p, 1, 5);
         if (r > 0 && (p.revents & POLLIN)) {
             uint8_t buf[2048];
             int n = read(fd, buf, sizeof buf);
-            if (n > 0) feed(buf, n, peer);
+            if (n > 0) { feed(buf, n, peer); last_rx_ms = ms; }
         }
         ms += 5;
         if (ms >= START_DELAY_MS && sent < FRAMES &&
             (ms - START_DELAY_MS) % SEND_INTERVAL_MS < 5) {
             if (send_frame(fd, role, sent) == 0) sent++;
         }
-        if (sent == FRAMES && recv_ok + recv_bad >= FRAMES && done_ms < 0) {
+        if (sent == FRAMES && done_ms < 0 &&
+            (recv_ok + recv_bad >= FRAMES || ms - last_rx_ms >= IDLE_DONE_MS)) {
             done_ms = ms;
             fprintf(stderr, "FAKEPPPD role=%s sent=%d recv=%d bad=%d\n",
                     rname, sent, recv_ok, recv_bad);

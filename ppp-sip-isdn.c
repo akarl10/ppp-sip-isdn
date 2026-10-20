@@ -27,6 +27,8 @@
 #include "clearmode_codec.h"
 #include "hdlc-bitstream.h"
 #include <wordexp.h>
+#include <spawn.h>
+#include <dirent.h>
 
 #define PPPD_MAX_ARGS 64
 #define T_UDP 0
@@ -67,147 +69,154 @@ typedef struct {
     pid_t pid;
 } ppp_link;
 
+static void fmt_ip(char *out, size_t len, uint32_t ip)
+{
+    if (!ip) { out[0] = 0; return; }
+    snprintf(out, len, "%u.%u.%u.%u", (ip&0xff000000)>>24, (ip&0xff0000)>>16, (ip&0xff00)>>8, (ip&0xff));
+}
+
+/* Spawns pppd (or the setuid helper) on the slave side of a new PTY.
+ * posix_spawn instead of fork: fork() of a multithreaded process takes the mm
+ * lock and sets up copy-on-write, which can stall the media threads. */
 static int start_pppd(ppp_link *link, const char *args, uint32_t remoteip)
 {
     int master_fd, slave_fd;
     char slave_name[64];
+    char l[62], r[62];
+    char *argv[PPPD_MAX_ARGS+1];
+    char *envp_empty[] = { NULL };
+    char **envp = envp_empty;
+    const char *path;
+    int ac = 0;
+    wordexp_t we;
+    int have_we = 0;
+    pid_t pid;
+    int rc = -1;
 
-    if (openpty(&master_fd, &slave_fd, slave_name, NULL, NULL) < 0) {
-        perror("openpty");
-        return -1;
+    fmt_ip(l, sizeof(l), cli_ppplocalip);
+    fmt_ip(r, sizeof(r), remoteip);
+
+    if (secure_ppp) {
+        /* The setuid root helper takes the pts number and validates it itself:
+         * "/dev/pts/<n>" is the only form accepted. */
+        const char *prefix = "/dev/pts/";
+        char *end = NULL;
+        if (openpty(&master_fd, &slave_fd, slave_name, NULL, NULL) < 0) {
+            perror("openpty");
+            return -1;
+        }
+        if (strncmp(slave_name, prefix, strlen(prefix)) != 0) {
+            printf("unexpected pty name %s\n", slave_name);
+            goto fail_close;
+        }
+        strtol(slave_name + strlen(prefix), &end, 10);
+        if (!end || *end != '\0') {
+            printf("unexpected pty name %s\n", slave_name);
+            goto fail_close;
+        }
+        path = SECURE_PPP_HELPER;
+        argv[ac++] = "sip-isdn-pppd";
+        argv[ac++] = slave_name + strlen(prefix);
+        argv[ac++] = l;
+        argv[ac++] = r;
+        argv[ac] = NULL;
+    } else {
+        char localremote[128];
+        if (openpty(&master_fd, &slave_fd, slave_name, NULL, NULL) < 0) {
+            perror("openpty");
+            return -1;
+        }
+        extern char **environ;
+        envp = environ;
+        path = PPPD_PATH;
+        argv[ac++] = "sip-isdn-pppd"; //let userspace see this one is special
+        argv[ac++] = slave_name;
+        argv[ac++] = "nodetach";
+        if (remoteip || cli_ppplocalip) {
+            snprintf(localremote, sizeof(localremote), "%s:%s", l, r);
+            argv[ac++] = localremote;
+        }
+        if (args && wordexp(args, &we, WRDE_NOCMD) == 0) {
+            have_we = 1;
+            for (size_t i = 0; i < we.we_wordc && ac < PPPD_MAX_ARGS; i++)
+                argv[ac++] = we.we_wordv[i];
+        }
+        argv[ac] = NULL;
     }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        close(master_fd);
-        close(slave_fd);
-        return -1;
-    }
-
-    if (pid == 0) {
-        /* Child */
-        close(master_fd);
-        setsid();
-        close(slave_fd);
-        /* don't leak SIP sockets or other lines' PTYs into pppd */
-        {
-            long maxfd = sysconf(_SC_OPEN_MAX);
-            if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
-            for (int fd = 3; fd < maxfd; fd++)
-                close(fd);
-        }
-        if(secure_ppp) {
-            char* args [5];
-            int strpos = strlen(slave_name)-1;
-            args[0] = "sip-isdn-pppd";
-            while (strpos>=0 && slave_name[strpos]!='/')
-                strpos--;
-            if(slave_name[strpos]=='/' && strpos == strlen("/dev/pts")) { //this is very lazy, but the setuid root binary checks validiy of the number
-                strpos ++;
-                char* end = 0;
-                char *envp[] = {
-                    NULL
-                };
-                strtol(slave_name + strpos,&end,10);
-                if(end && *end=='\0') {
-                    char r[62];
-                    char l[62];
-                    args[1]=slave_name + strpos;
-                    if(cli_ppplocalip) {
-                        snprintf(l,sizeof(l),"%u.%u.%u.%u",(cli_ppplocalip&0xff000000)>>24,(cli_ppplocalip&0xff0000)>>16,(cli_ppplocalip&0xff00)>>8,(cli_ppplocalip&0xff));
-                        args[2]=l;
-                    }
-                    else args[2]="";
-                    if(remoteip) {
-                        snprintf(r,sizeof(r),"%u.%u.%u.%u",(remoteip&0xff000000)>>24,(remoteip&0xff0000)>>16,(remoteip&0xff00)>>8,(remoteip&0xff));
-                        args[3]=r;
-                    }
-                    else args[3]="";
-                    args[4]=0;
-                    execve(SECURE_PPP_HELPER, args,envp);
-                    printf("calling secure pppd failed\n");
-                }
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawnattr_init(&attr);
+#ifdef POSIX_SPAWN_SETSID
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+#endif
+    /* don't leak SIP sockets or other lines' PTYs into pppd */
+#if defined(__GLIBC__) && __GLIBC_PREREQ(2, 34)
+    posix_spawn_file_actions_addclosefrom_np(&fa, 3);
+#else
+    {
+        /* close every other open descriptor, but not the one opendir() itself holds */
+        DIR *d = opendir("/proc/self/fd");
+        if (d) {
+            int dfd = dirfd(d);
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                int fd = atoi(de->d_name);
+                if (de->d_name[0] != '.' && fd > 2 && fd != dfd)
+                    posix_spawn_file_actions_addclose(&fa, fd);
             }
-            exit(1);
-        }
-        else {
-            char *argv[PPPD_MAX_ARGS+1];
-            int ac = 0;
-
-            argv[ac++] = "sip-isdn-pppd"; //let userspace see this one is special
-            argv[ac++] = slave_name;
-            argv[ac++] = "nodetach";
-
-            char localremote[128]; // 8*3(digits) + 3*2 (.) + 1 (:) + 1 (\0), 32 bytes, but compiler complains
-            if((remoteip || cli_ppplocalip) && ac < PPPD_MAX_ARGS) {
-                localremote[0]=0;
-                char l[62];
-                char r[62];
-                if(cli_ppplocalip) {
-                    snprintf(l,sizeof(l),"%u.%u.%u.%u",(cli_ppplocalip&0xff000000)>>24,(cli_ppplocalip&0xff0000)>>16,(cli_ppplocalip&0xff00)>>8,(cli_ppplocalip&0xff));
-                }
-                else l[0]=0;
-                if(remoteip) {
-                    snprintf(r,sizeof(r),"%u.%u.%u.%u",(remoteip&0xff000000)>>24,(remoteip&0xff0000)>>16,(remoteip&0xff00)>>8,(remoteip&0xff));
-                }
-                else r[0]=0;
-                snprintf(localremote,sizeof(localremote),"%s:%s",l,r);
-                argv[ac++] = localremote;
-            }
-
-            wordexp_t we;
-            int have_we = 0;
-            if (args && wordexp(args, &we, WRDE_NOCMD) == 0) {
-                have_we = 1;
-                for (size_t i = 0; i < we.we_wordc && ac<PPPD_MAX_ARGS; i++)
-                    argv[ac++] = we.we_wordv[i];
-            }
-
-            argv[ac] = NULL;
-
-            execv(PPPD_PATH, argv);
-            if(have_we)
-                wordfree(&we);
-            _exit(1);
+            closedir(d);
         }
     }
+#endif
+    if (posix_spawn(&pid, path, &fa, &attr, argv, envp) != 0) {
+        printf("spawning %s failed\n", path);
+    } else {
+        rc = 0;
+    }
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    if (have_we)
+        wordfree(&we);
+    if (rc != 0)
+        goto fail_close;
 
     close(slave_fd);
     fcntl(master_fd,F_SETFL, (fcntl(master_fd, F_GETFL, 0)|O_NONBLOCK));
     link->master_fd = master_fd;
     link->pid       = pid;
     return 0;
+
+fail_close:
+    close(master_fd);
+    close(slave_fd);
+    return -1;
 }
 
 static void stop_pppd(ppp_link *link)
 {
     if (link->pid > 0) {
         if(secure_ppp) {
-            pid_t pid = fork();
-            if (pid < 0) {
-                perror("fork");
+            /* posix_spawn instead of fork: fork() of a multithreaded process
+             * takes the mm lock and sets up copy-on-write, which can stall
+             * the media threads for milliseconds (see line teardown) */
+            char term_pid [32];
+            char* args [4];
+            pid_t pid;
+            snprintf(term_pid,sizeof(term_pid),"%d",link->pid);
+            args[0]=SECURE_PPP_HELPER;
+            args[1]="stop";
+            args[2]=term_pid;
+            args[3]=NULL;
+            char *envp[] = {
+                NULL
+            };
+            if (posix_spawn(&pid, SECURE_PPP_HELPER, NULL, NULL, args, envp) != 0) {
+                printf("calling secure pppd terminate failed\n");
                 return;
             }
-
-            if (pid == 0) {
-                char term_pid [32];
-                char* args [4];
-                snprintf(term_pid,sizeof(term_pid),"%d",link->pid);
-                args[0]=SECURE_PPP_HELPER;
-                args[1]="stop";
-                args[2]=term_pid;
-                args[3]=NULL;
-                char *envp[] = {
-                    NULL
-                };
-                execve(SECURE_PPP_HELPER, args,envp);
-                printf("calling secure pppd terminate failed\n");
-                exit (1);
-            }
-            else {
-                waitpid(pid,NULL,0);
-            }
+            waitpid(pid,NULL,0);
         }
         else {
             kill(link->pid, SIGHUP);
@@ -242,6 +251,7 @@ typedef struct {
     line_state_t state;
     pjsua_conf_port_id ppp_conf_id;
     volatile int pppd_exited; /* set by media thread, handled by main loop */
+    volatile int call_ended;  /* set by pjsip callback, handled by main loop */
 
 } ppp_media_port;
 
@@ -498,6 +508,7 @@ static pj_status_t ppp_media_port_reset(const char *pppd_args,
     p->rxfrmcnt       = 0;
     p->state         = LINE_ACTIVE;
     p->pppd_exited   = 0;
+    p->call_ended    = 0;
 
     if (start_pppd(&p->link, pppd_args, p->remoteip) != 0)
         return PJ_EUNKNOWN;
@@ -625,6 +636,25 @@ static void on_call_media_state(pjsua_call_id cid)
     }
 }
 
+/* with --loglevel > 0, print RTP / jitter buffer statistics when a stream ends:
+ * dropped or discarded packets there show up as lost HDLC data downstream */
+static void on_stream_destroyed(pjsua_call_id cid, pjmedia_stream *strm,
+                                unsigned stream_idx)
+{
+    pjmedia_rtcp_stat st;
+    pjmedia_jb_state jb;
+    PJ_UNUSED_ARG(stream_idx);
+    if (cli_loglevel <= 0)
+        return;
+    if (pjmedia_stream_get_stat(strm, &st) == PJ_SUCCESS &&
+        pjmedia_stream_get_stat_jbuf(strm, &jb) == PJ_SUCCESS)
+        printf("STREAMSTAT call=%d rx_pkt=%u rx_loss=%u rx_discard=%u rx_reorder=%u "
+               "jb_lost=%u jb_discard=%u jb_empty=%u jb_delay_avg=%ums max=%ums\n",
+               cid, (unsigned)st.rx.pkt, (unsigned)st.rx.loss, (unsigned)st.rx.discard,
+               (unsigned)st.rx.reorder, jb.lost, jb.discard, jb.empty,
+               jb.avg_delay, jb.max_delay);
+}
+
 static void on_call_state(pjsua_call_id cid, pjsip_event *e)
 {
     PJ_UNUSED_ARG(e);
@@ -637,9 +667,12 @@ static void on_call_state(pjsua_call_id cid, pjsip_event *e)
         ppp = (void*)pjsua_call_get_user_data(cid);
         int activecnt = 0;
         if(ppp) {
-            if(ppp->state == LINE_ACTIVE) {
-                ppp_destroy((pjmedia_port *)ppp);
-            }
+            /* This runs on pjsip's worker thread, which also receives RTP for
+             * all other lines: don't fork/wait/lock here, the main loop does
+             * the teardown (a few ms of blocking is enough to starve the
+             * jitter buffers of the other lines). */
+            if(ppp->state == LINE_ACTIVE)
+                ppp->call_ended = 1;
         }
         else if(cli_dial) {
             /* call failed before media came up: release its reserved line */
@@ -804,6 +837,7 @@ int main(int argc, char **argv)
     cfg.cb.on_incoming_call   = on_incoming_call;
     cfg.cb.on_call_media_state= on_call_media_state;
     cfg.cb.on_call_state      = on_call_state;
+    cfg.cb.on_stream_destroyed = on_stream_destroyed;
 
     pj_pool_t* pjsua_pool = pjsua_pool_create("pjsua", 128, 128);
 
@@ -936,6 +970,8 @@ int main(int argc, char **argv)
         for(int i=0;i<linecount;i++) {
             if(lines[i].state==LINE_ACTIVE && lines[i].pppd_exited)
                 handle_pppd_exit(&lines[i]);
+            else if(lines[i].state==LINE_ACTIVE && lines[i].call_ended)
+                ppp_destroy((pjmedia_port *)&lines[i]);
             if(lines[i].state==LINE_STOPPING) {
                 int ppp_status;
                 if((waitpid(lines[i].link.pid, &ppp_status, WNOHANG)) != 0) {

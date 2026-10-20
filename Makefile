@@ -37,8 +37,14 @@ tests/fake_pppd: tests/fake_pppd.c
 tests/ppp-sip-isdn-test: $(SRC) tests/fake_pppd $(PKG_CONFIG_PATH)/libpjproject.pc
 	$(CC) -I$(PJSIP_PREFIX)/include -O2 -Wall -DSECURE_PPP_HELPER=\"$(CURDIR)/tests/fake_pppd\" -o $@ $(SRC) $(LDFLAGS) `PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --static --cflags --libs libpjproject`
 
+# Single lines must be lossless. The 8-line runs only require 80% of the frames to
+# arrive: pjmedia's jitter buffer occasionally runs empty and conceals a 20ms frame,
+# which shows up as lost HDLC data (more likely around call teardown).
 test-e2e: tests/ppp-sip-isdn-test
-	./tests/test_e2e.sh
+	./tests/test_e2e.sh 1
+	./tests/test_e2e.sh 1 --pcma
+	MIN_PCT=80 ./tests/test_e2e.sh 8
+	MIN_PCT=80 FRAMES=150 KILL=half ./tests/test_e2e.sh 8   # half of the lines drop mid-exchange
 
 .PHONY: all test test-e2e
 

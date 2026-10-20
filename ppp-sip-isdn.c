@@ -53,7 +53,7 @@ static uint32_t cli_pppremoteipstart = 0;
 static uint32_t cli_ppplocalip = 0;
 static int cli_port = 0;
 static int cli_loglevel = 0;
-static int terminate = 0;
+static volatile sig_atomic_t terminate = 0;
 static int linecount = 1;
 static int cli_ip6 = 0;
 static int cli_srtp = 0;
@@ -90,6 +90,13 @@ static int start_pppd(ppp_link *link, const char *args, uint32_t remoteip)
         close(master_fd);
         setsid();
         close(slave_fd);
+        /* don't leak SIP sockets or other lines' PTYs into pppd */
+        {
+            long maxfd = sysconf(_SC_OPEN_MAX);
+            if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+            for (int fd = 3; fd < maxfd; fd++)
+                close(fd);
+        }
         if(secure_ppp) {
             char* args [5];
             int strpos = strlen(slave_name)-1;
@@ -234,6 +241,7 @@ typedef struct {
     uint32_t remoteip;
     line_state_t state;
     pjsua_conf_port_id ppp_conf_id;
+    volatile int pppd_exited; /* set by media thread, handled by main loop */
 
 } ppp_media_port;
 
@@ -288,9 +296,16 @@ static void deliver_ppp_frame(const uint8_t *data, int len, void *user)
                 pjsua_call_info ci;
                 pjsua_call_get_info(p->call, &ci);
                 pjsua_call_id current_call = PJSUA_INVALID_ID;
+                pjsua_call_setting call_settings;
+                pjsua_call_setting_default(&call_settings);
+                call_settings.aud_cnt = 1;
+                call_settings.vid_cnt = 0;
+                call_settings.txt_cnt = 0;
                 printf("\n\n----ADDING LINE %d----\n\n",i+1);
-                pjsua_call_make_call(ci.acc_id, &dialstr, 0, NULL, NULL, &current_call);
-                i = linecount;
+                lines[i].state = LINE_RESERVED_DIALOUT; /* claim it so it isn't picked twice */
+                if (pjsua_call_make_call(ci.acc_id, &dialstr, &call_settings, NULL, NULL, &current_call) != PJ_SUCCESS)
+                    lines[i].state = LINE_FREE;
+                break;
             }
         }
     }
@@ -301,7 +316,7 @@ pj_status_t ppp_put_frame(pjmedia_port *port,
 {
     ppp_media_port *p = (ppp_media_port*)port;
 
-    int needed = f->size/2;
+    unsigned needed = f->size/2;
     if((p->state!=LINE_ACTIVE && p->state!=LINE_STOPPING) || p->rx==0)
         return PJ_SUCCESS;
 
@@ -419,19 +434,13 @@ static pj_status_t ppp_get_frame(pjmedia_port *port,
     unsigned need = f->size/2;
     unsigned w = 0;
     int ppp_status;
-    if((waitpid(p->link.pid, &ppp_status, WNOHANG)) != 0) {
-        p->link.pid = 0; // already down, no need to send HUP to pppd
-        pjsua_call_hangup(p->call,0,NULL,NULL);
-        f->size=0;
+    if(p->pppd_exited ||
+       (p->link.pid > 0 && waitpid(p->link.pid, &ppp_status, WNOHANG) != 0)) {
+        /* Don't tear down from the media thread: the main loop hangs up
+         * the call and removes the port (see handle_pppd_exit). */
+        p->pppd_exited = 1;
+        memset(f->buf,0x7e,f->size);
         f->type = PJMEDIA_FRAME_TYPE_AUDIO;
-        printf("PPP Line went down\n");
-        ppp_destroy(port);
-        int activecnt = 0;
-        for(int i=0;i<linecount;i++) {
-            activecnt += (lines[i].state!=LINE_FREE?1:0);
-        }
-        if(cli_dial && activecnt == 0)
-            terminate = 1;
         return PJ_SUCCESS;
     }
 
@@ -488,6 +497,7 @@ static pj_status_t ppp_media_port_reset(const char *pppd_args,
     p->txfrmcnt       = 0;
     p->rxfrmcnt       = 0;
     p->state         = LINE_ACTIVE;
+    p->pppd_exited   = 0;
 
     if (start_pppd(&p->link, pppd_args, p->remoteip) != 0)
         return PJ_EUNKNOWN;
@@ -500,6 +510,17 @@ static pj_status_t ppp_media_port_reset(const char *pppd_args,
     hdlc_tx_init(p->tx); //reset
 
     return PJ_SUCCESS;
+}
+
+/* Called from the main loop when the media thread noticed pppd exiting */
+static void handle_pppd_exit(ppp_media_port *p)
+{
+    printf("PPP Line went down\n");
+    p->link.pid = 0; // already down, no need to send HUP to pppd
+    p->pppd_exited = 0;
+    pjsua_call_hangup(p->call,0,NULL,NULL);
+    if (p->state == LINE_ACTIVE)
+        ppp_destroy((pjmedia_port *)p);
 }
 
 /* ================= CLEARMODE ONLY SETUP ================= */
@@ -567,15 +588,15 @@ static void on_call_media_state(pjsua_call_id cid)
             return;
         }
         
-        for(int i=0;i<linecount;i++) {
-            if(lines[i].state==LINE_FREE) {
+        /* dial-out calls own a reserved line; prefer it over any free one */
+        if(cli_dial) {
+            for(int i=0;i<linecount && !ppp;i++)
+                if(lines[i].state==LINE_RESERVED_DIALOUT)
+                    ppp = &(lines[i]);
+        }
+        for(int i=0;i<linecount && !ppp;i++) {
+            if(lines[i].state==LINE_FREE)
                 ppp = &(lines[i]);
-                i=linecount;
-            }
-            else if(cli_dial && lines[i].state==LINE_RESERVED_DIALOUT) {
-                ppp = &(lines[i]);
-                i=linecount;
-            }
         }
         if(!ppp) {
             printf("no free line found\n");
@@ -618,6 +639,15 @@ static void on_call_state(pjsua_call_id cid, pjsip_event *e)
         if(ppp) {
             if(ppp->state == LINE_ACTIVE) {
                 ppp_destroy((pjmedia_port *)ppp);
+            }
+        }
+        else if(cli_dial) {
+            /* call failed before media came up: release its reserved line */
+            for(int i=0;i<linecount;i++) {
+                if(lines[i].state==LINE_RESERVED_DIALOUT) {
+                    lines[i].state = LINE_FREE;
+                    break;
+                }
             }
         }
         for(int i=0;i<linecount;i++) {
@@ -730,9 +760,17 @@ static void configure_dns_resolver(pjsua_config* cfg,pj_pool_t* pjsua_pool) {
 
 /* ================= MAIN ================= */
 
+static void on_signal(int sig)
+{
+    (void)sig;
+    terminate = 1;
+}
+
 int main(int argc, char **argv)
 {
     secure_ppp = 1;
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
     parse_cli(argc, argv);
 
     lines = calloc(sizeof(ppp_media_port),linecount);
@@ -780,8 +818,22 @@ int main(int argc, char **argv)
     media.snd_clock_rate = 8000;
     media.no_vad = 1;
     
+    int transport = T_UDP;
+    if(cli_reg && strncmp(cli_reg,"sips:",5)==0)
+        transport = T_TLS;
+    else if(cli_reg && strcasestr(cli_reg,"transport=tcp")!=NULL)
+        transport = T_TCP;
+    else if(cli_reg && strcasestr(cli_reg,"transport=tls")!=NULL)
+        transport = T_TLS;
+    else if(cli_dial && strncmp(cli_dial,"sips:",5)==0)
+        transport = T_TLS;
+    else if(cli_dial && strcasestr(cli_dial,"transport=tcp")!=NULL)
+        transport = T_TCP;
+    else if(cli_dial && strcasestr(cli_dial,"transport=tls")!=NULL)
+        transport = T_TLS;
+
     if(cli_srtp) {
-        cfg.use_srtp = PJMEDIA_SRTP_OPTIONAL;
+        cfg.use_srtp = (transport==T_TLS?PJMEDIA_SRTP_MANDATORY:PJMEDIA_SRTP_OPTIONAL);
         cfg.srtp_secure_signaling = 0;
         pjsua_srtp_opt_default(&cfg.srtp_opt);
         cfg.srtp_opt.keying_count=2;
@@ -807,20 +859,6 @@ int main(int argc, char **argv)
     tcfg.port = cli_port;
     pj_status_t status;
 
-    int transport = T_UDP;
-    if(cli_reg && strncmp(cli_reg,"sips:",5)==0)
-        transport = T_TLS;
-    else if(cli_reg && strcasestr(cli_reg,"transport=tcp")!=NULL)
-        transport = T_TCP;
-    else if(cli_reg && strcasestr(cli_reg,"transport=tls")!=NULL)
-        transport = T_TLS;
-    else if(cli_dial && strncmp(cli_dial,"sips:",5)==0)
-        transport = T_TLS;
-    else if(cli_dial && strcasestr(cli_dial,"transport=tcp")!=NULL)
-        transport = T_TCP;
-    else if(cli_dial && strcasestr(cli_dial,"transport=tls")!=NULL)
-        transport = T_TLS;
-
     status = pjsua_transport_create(
         (transport==T_UDP?PJSIP_TRANSPORT_UDP:
             (transport==T_TLS?PJSIP_TRANSPORT_TLS:PJSIP_TRANSPORT_TCP)
@@ -833,9 +871,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if(transport == T_TLS && cli_srtp)
-        cfg.use_srtp = PJMEDIA_SRTP_MANDATORY;
-    
     printf("SIP UDP transport active on port %d\n", cli_port);
 
     pjsua_start();
@@ -896,9 +931,11 @@ int main(int argc, char **argv)
     }
 
     while(!terminate) {
-        pj_thread_sleep(1000);
+        pj_thread_sleep(250);
         int activecnt = 0;
         for(int i=0;i<linecount;i++) {
+            if(lines[i].state==LINE_ACTIVE && lines[i].pppd_exited)
+                handle_pppd_exit(&lines[i]);
             if(lines[i].state==LINE_STOPPING) {
                 int ppp_status;
                 if((waitpid(lines[i].link.pid, &ppp_status, WNOHANG)) != 0) {
@@ -918,11 +955,38 @@ int main(int argc, char **argv)
             terminate = 1;
     }
 
+    /* clean shutdown: drop calls, stop pppd instances, wait briefly for them */
+    pjsua_call_hangup_all();
     for(int i=0;i<linecount;i++) {
+        if(lines[i].state==LINE_ACTIVE)
+            ppp_destroy((pjmedia_port *)&lines[i]);
+    }
+    for(int t=0;t<20;t++) {
+        int pending = 0;
+        for(int i=0;i<linecount;i++) {
+            if(lines[i].state==LINE_STOPPING) {
+                if(lines[i].link.pid>0 && waitpid(lines[i].link.pid, NULL, WNOHANG) == 0)
+                    pending++;
+                else {
+                    lines[i].link.pid = 0;
+                    lines[i].state = LINE_FREE;
+                }
+            }
+        }
+        if(!pending) break;
+        pj_thread_sleep(100);
+    }
+    for(int i=0;i<linecount;i++) {
+        if(lines[i].link.master_fd>=0) {
+            close(lines[i].link.master_fd);
+            lines[i].link.master_fd = -1;
+        }
         hdlc_tx_free(lines[i].tx);
         hdlc_rx_free(lines[i].rx);
         pj_pool_release(lines[i].pool);
     }
     pj_pool_release(pjsua_pool);
+    pjsua_destroy();
+    return 0;
 }
 

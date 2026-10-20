@@ -15,6 +15,7 @@ typedef struct hdlc_rx_state {
 
     uint8_t  frame_buf[4096];
     int      frame_len;
+    int      overflow;
 
     uint8_t  cur_byte;
     int      cur_bitpos;
@@ -52,14 +53,20 @@ void hdlc_rx_push_byte(hdlc_rx_state *s, uint8_t b,
 
         if (s->last8 == 0x7E) {
             s->ones = 0;
-            s->cur_byte = 0;
-            s->cur_bitpos = 0;
 
-            if (cb && s->in_frame && s->frame_len > 0)
+            /* The 7 leading flag bits (0 + six 1s) were already shifted into
+             * cur_byte before the closing 0 was seen, so a frame that is a
+             * whole number of octets leaves cur_bitpos == 7. Anything else is
+             * gibberish and dropped. */
+            if (cb && s->in_frame && s->frame_len > 0 && !s->overflow &&
+                s->cur_bitpos == 7)
                 cb(s->frame_buf, s->frame_len, user);
 
+            s->cur_byte = 0;
+            s->cur_bitpos = 0;
             s->in_frame = 1;
             s->frame_len = 0;
+            s->overflow = 0;
 
             continue;
         }
@@ -69,6 +76,14 @@ void hdlc_rx_push_byte(hdlc_rx_state *s, uint8_t b,
 
         if (bit) {
             s->ones++;
+            if (s->ones >= 7) { /* abort sequence: discard frame, wait for next flag */
+                s->in_frame = 0;
+                s->frame_len = 0;
+                s->overflow = 0;
+                s->cur_byte = 0;
+                s->cur_bitpos = 0;
+                continue;
+            }
         } else {
             if (s->ones == 5) {
                 s->ones = 0;
@@ -83,6 +98,8 @@ void hdlc_rx_push_byte(hdlc_rx_state *s, uint8_t b,
         if (s->cur_bitpos == 8) {
             if (s->frame_len < (int)sizeof(s->frame_buf))
                 s->frame_buf[s->frame_len++] = s->cur_byte;
+            else
+                s->overflow = 1;
             s->cur_bitpos = 0;
             s->cur_byte = 0;
         }

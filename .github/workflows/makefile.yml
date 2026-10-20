@@ -22,3 +22,9 @@ jobs:
 
     - name: Build
       run: make
+    
+    - name: Test HDLC
+      run: make test
+
+    - name: Test E2E
+      run: make test-e2e

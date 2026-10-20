@@ -10,6 +10,7 @@
 # environment:
 #   FRAMES=n   frames each side sends per line (default 30, max 255)
 #   MIN_PCT=n  percentage of frames that must arrive intact (default 100)
+#   KILL=stagger  like half, but one line every STAGGER_MS (default 500) instead of all at once
 #   KILL=half  once all lines are up and exchanging, SIGTERM the fake pppd of
 #              every second line on the client side (like pppd dying); the
 #              other lines must carry on undisturbed
@@ -19,6 +20,8 @@ LINES=${1:-1}
 EXTRA=("$@")
 FRAMES=${FRAMES:-30}
 KILL=${KILL:-none}
+STAGGER_MS=${STAGGER_MS:-500}
+KILL_T=()
 MIN_PCT=${MIN_PCT:-100}
 export FAKE_PPPD_FRAMES=$FRAMES
 echo "== e2e: $LINES line(s), $FRAMES frames, kill=$KILL, min ${MIN_PCT}% ${EXTRA[*]:-}"
@@ -28,6 +31,7 @@ WORK=$(mktemp -d)
 SRV_PID=; CLI_PID=
 trap 'kill $SRV_PID $CLI_PID 2>/dev/null; rm -rf "$WORK"' EXIT
 FAILED=0
+mono_ms() { perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%d\n", clock_gettime(CLOCK_MONOTONIC)*1000'; }
 fail() { echo "FAIL: $*"; FAILED=1; }
 
 $APP --id sip:server@127.0.0.1 --bindport 5556 --linecount $LINES --loglevel 1 "${EXTRA[@]}" \
@@ -43,7 +47,7 @@ $APP --id sip:client@127.0.0.1 --bindport 5557 --linecount $LINES --loglevel 1 "
 CLI_PID=$!
 
 KILLED=0
-if [ "$KILL" = half ]; then
+if [ "$KILL" = half ] || [ "$KILL" = stagger ]; then
     # wait until every line is up, let them exchange for a while, then kill every second one
     for i in $(seq 1 300); do
         [ "$(grep -c '^FAKEUP' "$WORK/cli.err")" -ge "$LINES" ] && break
@@ -53,7 +57,10 @@ if [ "$KILL" = half ]; then
     n=0
     for pid in $(pgrep -P $CLI_PID | sort -n); do
         n=$((n+1))
-        if [ $((n % 2)) -eq 0 ]; then kill -TERM $pid && KILLED=$((KILLED+1)); fi
+        if [ $((n % 2)) -eq 0 ]; then
+            kill -TERM $pid && KILLED=$((KILLED+1)) && KILL_T+=($(mono_ms))
+            [ "$KILL" = stagger ] && sleep $(awk "BEGIN{print $STAGGER_MS/1000}")
+        fi
     done
     echo "killed $KILLED of $LINES fake pppd instances on the client side"
 fi
@@ -93,6 +100,16 @@ check_side cli client
 check_side srv server
 n=$(grep -c '^FAKEPPPD' "$WORK/srv.err")
 [ "$n" -eq "$LINES" ] || fail "server: expected $LINES result lines, got $n"
+if [ ${#KILL_T[@]} -gt 0 ]; then
+    # frame problems seen by lines that ran to completion, grouped by the kill that precedes them
+    echo "kills at (ms rel. to first): $(for k in "${KILL_T[@]}"; do echo $((k-${KILL_T[0]})); done | tr '\n' ' ')"
+    echo "problem frames at (ms rel. to first kill): $(cat "$WORK/srv.err" "$WORK/cli.err" | sed -n 's/^EVT t=\([0-9]*\).*/\1/p' | sort -n | while read -r e; do echo $((e-${KILL_T[0]})); done | tr '\n' ' ')"
+    echo "EVENTS $(cat "$WORK/srv.err" "$WORK/cli.err" | sed -n 's/^EVT t=\([0-9]*\).*/\1/p' | \
+        awk -v kills="${KILL_T[*]}" 'BEGIN{n=split(kills,k," ")} {t=$1; hit=0
+            for(i=1;i<=n;i++) if(t>=k[i] && t<k[i]+1000 && (i==n || t<k[i+1])) {c[i]++; hit=1; break}
+            if(!hit) other++}
+          END{for(i=1;i<=n;i++) printf "kill%d=%d ", i, c[i]+0; printf "other=%d", other+0}')"
+fi
 if [ $FAILED -ne 0 ]; then
     for f in srv cli; do
         echo "--- $f stderr"; cat "$WORK/$f.err"

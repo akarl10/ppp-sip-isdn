@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define DEFAULT_FRAMES 30   /* overridable: FAKE_PPPD_FRAMES in ppp-sip-isdn's environment, max 255 */
@@ -105,17 +106,34 @@ static int send_frame(int fd, int role, int idx)
     return write(fd, out, o) == o ? 0 : -1;
 }
 
+/* Frame problems are timestamped (CLOCK_MONOTONIC, ms) and printed with the result of
+ * lines that ran to completion, so the test script can relate them to events
+ * such as other lines being torn down. */
+static long long evt[64];
+static int nevt;
+static void note_evt(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (nevt < 64) evt[nevt++] = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static void print_evts(void)
+{
+    for (int i = 0; i < nevt; i++) fprintf(stderr, "EVT t=%lld\n", evt[i]);
+}
+
 static int next_idx;   /* next expected incoming frame */
 static int recv_ok, recv_bad;
 
 static void check_frame(const uint8_t *f, int n, int peer_role)
 {
     uint8_t exp[512];
-    if (n < 4 + 2 + 2) { recv_bad++; fprintf(stderr, "short frame %d\n", n); return; }
-    if (fcs16(f, n) != 0xf0b8) { recv_bad++; fprintf(stderr, "bad FCS (len %d)\n", n); return; }
+    if (n < 4 + 2 + 2) { note_evt(); recv_bad++; fprintf(stderr, "short frame %d\n", n); return; }
+    if (fcs16(f, n) != 0xf0b8) { note_evt(); recv_bad++; fprintf(stderr, "bad FCS (len %d)\n", n); return; }
     int idx = f[5];
     int en = make_body(exp, peer_role, idx);
     if (idx != next_idx || n - 2 != en || memcmp(f, exp, en)) {
+        note_evt();
         recv_bad++;
         fprintf(stderr, "unexpected frame idx=%d (expected %d) len=%d\n", idx, next_idx, n - 2);
         next_idx = idx + 1;
@@ -188,6 +206,7 @@ int main(int argc, char **argv)
         if (sent == FRAMES && done_ms < 0 &&
             (recv_ok + recv_bad >= FRAMES || ms - last_rx_ms >= IDLE_DONE_MS)) {
             done_ms = ms;
+            print_evts();
             fprintf(stderr, "FAKEPPPD role=%s sent=%d recv=%d bad=%d\n",
                     rname, sent, recv_ok, recv_bad);
             reported = 1;
@@ -195,6 +214,7 @@ int main(int argc, char **argv)
         if (role == 2 && done_ms >= 0 && ms - done_ms >= LINGER_MS)
             return recv_bad ? 1 : 0;
     }
+    if (!reported && sent == FRAMES) print_evts();
     if (!reported)
         fprintf(stderr, "FAKEPPPD role=%s sent=%d recv=%d bad=%d%s\n", rname,
                 sent, recv_ok, recv_bad, got_alrm ? " TIMEOUT" : "");

@@ -26,14 +26,15 @@
 #include <time.h>
 #include <unistd.h>
 
-#define DEFAULT_FRAMES 30   /* overridable: FAKE_PPPD_FRAMES in ppp-sip-isdn's environment, max 255 */
-#define SEND_INTERVAL_MS 30
+#define DEFAULT_FRAMES 250  /* overridable: FAKE_PPPD_FRAMES in ppp-sip-isdn's environment, max 65535 */
+#define DEFAULT_INTERVAL_MS 20   /* one codec frame; overridable: FAKE_PPPD_INTERVAL_MS */
 #define START_DELAY_MS 300
 #define IDLE_DONE_MS 1500   /* after sending: peer silent this long => assume the rest was lost */
-#define LINGER_MS 2000      /* client: let tx drain before exiting */
+#define LINGER_MS 500       /* client: let tx drain before exiting (the call ends with it) */
 #define TIMEOUT_S 40
 
 static int FRAMES = DEFAULT_FRAMES;
+static int INTERVAL_MS = DEFAULT_INTERVAL_MS;
 static volatile sig_atomic_t got_hup, got_alrm;
 
 /* ppp-sip-isdn starts us with an empty environment, but its own environment
@@ -50,7 +51,11 @@ static void read_parent_config(void)
         const char *e = buf + i;
         if (!strncmp(e, "FAKE_PPPD_FRAMES=", 17)) {
             int v = atoi(e + 17);
-            if (v > 0 && v <= 255) FRAMES = v;
+            if (v > 0 && v <= 65535) FRAMES = v;
+        }
+        if (!strncmp(e, "FAKE_PPPD_INTERVAL_MS=", 22)) {
+            int v = atoi(e + 22);
+            if (v > 0) INTERVAL_MS = v;
         }
         i += strlen(e) + 1;
     }
@@ -72,6 +77,7 @@ static uint16_t fcs16(const uint8_t *p, int n)
 /* frame body (without FCS): FF 03 00 21 role idx payload... */
 static int make_body(uint8_t *b, int role, int idx)
 {
+    idx &= 0xff;
     int plen = 20 + (idx * 37) % 200;
     int n = 0;
     b[n++] = 0xff; b[n++] = 0x03; b[n++] = 0x00; b[n++] = 0x21;
@@ -109,13 +115,17 @@ static int send_frame(int fd, int role, int idx)
 /* Frame problems are timestamped (CLOCK_MONOTONIC, ms) and printed with the result of
  * lines that ran to completion, so the test script can relate them to events
  * such as other lines being torn down. */
+static long long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 static long long evt[64];
 static int nevt;
 static void note_evt(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    if (nevt < 64) evt[nevt++] = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    if (nevt < 64) evt[nevt++] = now_ms();
 }
 static void print_evts(void)
 {
@@ -136,10 +146,10 @@ static void check_frame(const uint8_t *f, int n, int peer_role)
         note_evt();
         recv_bad++;
         fprintf(stderr, "unexpected frame idx=%d (expected %d) len=%d\n", idx, next_idx, n - 2);
-        next_idx = idx + 1;
+        next_idx = (idx + 1) & 0xff;
         return;
     }
-    next_idx++;
+    next_idx = (next_idx + 1) & 0xff;
     recv_ok++;
 }
 
@@ -189,19 +199,23 @@ int main(int argc, char **argv)
     tcgetattr(fd, &t); cfmakeraw(&t); tcsetattr(fd, TCSANOW, &t);
 
     fprintf(stderr, "FAKEUP role=%s\n", rname);   /* lets the test script see the line is up */
-    int sent = 0, ms = 0, done_ms = -1, reported = 0, last_rx_ms = 0;
+    /* real elapsed time: poll() returns early when data arrives, so counting
+     * loop iterations would run the send schedule and timeouts too fast */
+    long long t0 = now_ms(), next_send = START_DELAY_MS;
+    long long ms = 0, done_ms = -1, last_rx_ms = 0;
+    int sent = 0, reported = 0;
     while (!got_hup && !got_alrm) {
         struct pollfd p = { fd, POLLIN, 0 };
         int r = poll(&p, 1, 5);
+        ms = now_ms() - t0;
         if (r > 0 && (p.revents & POLLIN)) {
             uint8_t buf[2048];
             int n = read(fd, buf, sizeof buf);
             if (n > 0) { feed(buf, n, peer); last_rx_ms = ms; }
         }
-        ms += 5;
-        if (ms >= START_DELAY_MS && sent < FRAMES &&
-            (ms - START_DELAY_MS) % SEND_INTERVAL_MS < 5) {
+        if (sent < FRAMES && ms >= next_send) {
             if (send_frame(fd, role, sent) == 0) sent++;
+            next_send += INTERVAL_MS;
         }
         if (sent == FRAMES && done_ms < 0 &&
             (recv_ok + recv_bad >= FRAMES || ms - last_rx_ms >= IDLE_DONE_MS)) {

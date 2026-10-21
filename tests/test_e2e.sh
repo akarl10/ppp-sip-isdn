@@ -8,23 +8,26 @@
 #   test_e2e.sh 8               8 bundled lines (multilink)
 #   test_e2e.sh 1 --pcma        single line, PCMA bearer (easter egg mode)
 # environment:
-#   FRAMES=n   frames each side sends per line (default 30, max 255)
+#   FRAMES=n   frames each side sends per line (default 250, max 65535); one frame
+#              every INTERVAL_MS, so the traffic spans the whole call (default 5 s)
+#   INTERVAL_MS=n  spacing of the frames (default 20 = one codec frame)
 #   MIN_PCT=n  percentage of frames that must arrive intact (default 100)
 #   KILL=stagger  like half, but one line every STAGGER_MS (default 500) instead of all at once
 #   KILL=half  once all lines are up and exchanging, SIGTERM the fake pppd of
 #              every second line on the client side (like pppd dying); the
 #              other lines must carry on undisturbed
 set -u
-LINES=${1:-1}
+LINECOUNT=${1:-1}
 [ $# -gt 0 ] && shift
 EXTRA=("$@")
-FRAMES=${FRAMES:-30}
+FRAMES=${FRAMES:-250}
+INTERVAL_MS=${INTERVAL_MS:-20}
 KILL=${KILL:-none}
 STAGGER_MS=${STAGGER_MS:-500}
 KILL_T=()
 MIN_PCT=${MIN_PCT:-100}
-export FAKE_PPPD_FRAMES=$FRAMES
-echo "== e2e: $LINES line(s), $FRAMES frames, kill=$KILL, min ${MIN_PCT}% ${EXTRA[*]:-}"
+export FAKE_PPPD_FRAMES=$FRAMES FAKE_PPPD_INTERVAL_MS=$INTERVAL_MS
+echo "== e2e: $LINECOUNT line(s), $FRAMES frames, kill=$KILL, min ${MIN_PCT}% ${EXTRA[*]:-}"
 cd "$(dirname "$0")"
 APP=${APP:-./ppp-sip-isdn-test}
 WORK=$(mktemp -d)
@@ -34,14 +37,14 @@ FAILED=0
 mono_ms() { perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'printf "%d\n", clock_gettime(CLOCK_MONOTONIC)*1000'; }
 fail() { echo "FAIL: $*"; FAILED=1; }
 
-$APP --id sip:server@127.0.0.1 --bindport 5556 --linecount $LINES --loglevel 1 "${EXTRA[@]}" \
+$APP --id sip:server@127.0.0.1 --bindport 5556 --linecount $LINECOUNT --loglevel 1 "${EXTRA[@]}" \
      --ppplocalip 10.0.1.1 --pppremoteipstart 10.0.1.2 \
      >"$WORK/srv.out" 2>"$WORK/srv.err" &
 SRV_PID=$!
 sleep 1
 kill -0 $SRV_PID 2>/dev/null || { echo "FAIL: server did not start"; cat "$WORK/srv.out" "$WORK/srv.err"; exit 1; }
 
-$APP --id sip:client@127.0.0.1 --bindport 5557 --linecount $LINES --loglevel 1 "${EXTRA[@]}" \
+$APP --id sip:client@127.0.0.1 --bindport 5557 --linecount $LINECOUNT --loglevel 1 "${EXTRA[@]}" \
      --dial sip:server@127.0.0.1:5556 \
      >"$WORK/cli.out" 2>"$WORK/cli.err" &
 CLI_PID=$!
@@ -50,7 +53,7 @@ KILLED=0
 if [ "$KILL" = half ] || [ "$KILL" = stagger ]; then
     # wait until every line is up, let them exchange for a while, then kill every second one
     for i in $(seq 1 300); do
-        [ "$(grep -c '^FAKEUP' "$WORK/cli.err")" -ge "$LINES" ] && break
+        [ "$(grep -c '^FAKEUP' "$WORK/cli.err")" -ge "$LINECOUNT" ] && break
         sleep 0.1
     done
     sleep 1
@@ -62,7 +65,7 @@ if [ "$KILL" = half ] || [ "$KILL" = stagger ]; then
             [ "$KILL" = stagger ] && sleep $(awk "BEGIN{print $STAGGER_MS/1000}")
         fi
     done
-    echo "killed $KILLED of $LINES fake pppd instances on the client side"
+    echo "killed $KILLED of $LINECOUNT fake pppd instances on the client side"
 fi
 
 # wait for the client to finish (it exits when all its lines are gone)
@@ -77,7 +80,7 @@ kill -TERM $SRV_PID 2>/dev/null
 for i in $(seq 1 50); do kill -0 $SRV_PID 2>/dev/null || break; sleep 0.1; done
 if kill -0 $SRV_PID 2>/dev/null; then fail "server did not exit on SIGTERM"; kill -KILL $SRV_PID; fi
 
-SURVIVORS=$((LINES - KILLED))
+SURVIVORS=$((LINECOUNT - KILLED))
 # Per side, look at the lines whose pppd ran its full course (sent everything);
 # lines killed on purpose stop short of that and are not judged.
 # Pass = enough frames arrived intact (MIN_PCT of what was sent to those lines).
@@ -99,7 +102,7 @@ check_side() {
 check_side cli client
 check_side srv server
 n=$(grep -c '^FAKEPPPD' "$WORK/srv.err")
-[ "$n" -eq "$LINES" ] || fail "server: expected $LINES result lines, got $n"
+[ "$n" -eq "$LINECOUNT" ] || fail "server: expected $LINECOUNT result lines, got $n"
 if [ ${#KILL_T[@]} -gt 0 ]; then
     # frame problems seen by lines that ran to completion, grouped by the kill that precedes them
     echo "kills at (ms rel. to first): $(for k in "${KILL_T[@]}"; do echo $((k-${KILL_T[0]})); done | tr '\n' ' ')"
